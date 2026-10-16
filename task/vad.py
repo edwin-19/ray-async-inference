@@ -1,18 +1,17 @@
-
-import json
 import logging
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 
 import soundfile as sf
 import torch
-from silero_vad import load_silero_vad, get_speech_timestamps
+from silero_vad import get_speech_timestamps, load_silero_vad
 
 from ray import serve
 from ray.serve.config import AutoscalingConfig, AutoscalingPolicy
 from ray.serve.schema import CeleryAdapterConfig, TaskProcessorConfig
 from ray.serve.task_consumer import task_consumer, task_handler
+
+from common.job_store import update_task
 
 
 logging.basicConfig(
@@ -22,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("vad.consumer")
 
 
-# Redis configuration
+# Redis / Celery configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "mysecurepassword")
@@ -35,48 +34,6 @@ BACKEND_URL = (
 )
 
 QUEUE_NAME = "vad_queue"
-
-# Absolute defaults: independent of the current working directory.
-BASE_DIR = Path(
-    "/mnt/data/workspace/freelance/voice/queue_stt"
-)
-
-STATUS_DIR = Path(
-    os.getenv("VAD_STATUS_DIR", str(BASE_DIR / "vad_status"))
-).resolve()
-
-RESULTS_DIR = Path(
-    os.getenv("VAD_RESULTS_DIR", str(BASE_DIR / "vad_results"))
-).resolve()
-
-
-def write_json_atomic(path: Path, data: dict) -> None:
-    """Write JSON atomically to avoid readers seeing partial files."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    temp_path = path.with_name(
-        f"{path.stem}.{os.getpid()}.tmp"
-    )
-
-    with temp_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-    temp_path.replace(path)
-
-
-def update_status(task_id: str, status: str, **extra) -> None:
-    """Persist the current task status."""
-    status_path = STATUS_DIR / f"{task_id}.json"
-
-    write_json_atomic(
-        status_path,
-        {
-            "task_id": task_id,
-            "status": status,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            **extra,
-        },
-    )
 
 
 processor_config = TaskProcessorConfig(
@@ -111,24 +68,25 @@ class VADConsumer:
 
     def __init__(self):
         self.model = load_silero_vad()
-
-        STATUS_DIR.mkdir(parents=True, exist_ok=True)
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
         logger.info("Silero VAD model loaded")
-        logger.info("Status directory: %s", STATUS_DIR)
-        logger.info("Results directory: %s", RESULTS_DIR)
 
     @task_handler(name="detect")
     def detect(self, data):
         task_id = str(data["task_id"])
+
+        # Existing clients can keep sending task_id only.
+        # New pipeline clients can provide a separate job_id.
+        job_id = str(data.get("job_id", task_id))
         audio_path = Path(data["audio_path"]).resolve()
 
         try:
-            update_status(
+            update_task(
+                job_id,
                 task_id,
-                "processing",
+                task_type="vad",
+                status="processing",
                 audio_path=str(audio_path),
+                error=None,
             )
 
             if not audio_path.is_file():
@@ -158,9 +116,7 @@ class VADConsumer:
             ).flatten()
 
             if not torch.isfinite(waveform).all():
-                raise ValueError(
-                    "Audio contains NaN or infinity"
-                )
+                raise ValueError("Audio contains NaN or infinity")
 
             if waveform.numel() == 0:
                 segments = []
@@ -174,18 +130,13 @@ class VADConsumer:
 
                 segments = [
                     {
-                        "start": round(
-                            float(segment["start"]), 3
-                        ),
-                        "end": round(
-                            float(segment["end"]), 3
-                        ),
+                        "start": round(float(segment["start"]), 3),
+                        "end": round(float(segment["end"]), 3),
                     }
                     for segment in timestamps
                 ]
 
             output = {
-                "task_id": task_id,
                 "audio_path": str(audio_path),
                 "sample_rate": int(sample_rate),
                 "duration": round(
@@ -194,40 +145,48 @@ class VADConsumer:
                 "segments": segments,
             }
 
-            output_path = RESULTS_DIR / f"{task_id}.json"
-
-            write_json_atomic(output_path, output)
-
-            # Mark completed only after the result is written.
-            update_status(
+            # Persist the result directly in the job JSON.
+            update_task(
+                job_id,
                 task_id,
-                "completed",
-                result_path=str(output_path),
+                task_type="vad",
+                status="completed",
+                audio_path=str(audio_path),
+                sample_rate=int(sample_rate),
+                duration=output["duration"],
                 segment_count=len(segments),
+                result=output,
+                error=None,
             )
 
             logger.info(
-                "VAD completed: task=%s segments=%d result=%s",
+                "VAD completed: job=%s task=%s segments=%d",
+                job_id,
                 task_id,
                 len(segments),
-                output_path,
             )
 
             return None
 
         except Exception as exc:
-            logger.exception("VAD failed: task=%s", task_id)
+            logger.exception(
+                "VAD failed: job=%s task=%s",
+                job_id,
+                task_id,
+            )
 
             try:
-                update_status(
+                update_task(
+                    job_id,
                     task_id,
-                    "failed",
+                    task_type="vad",
+                    status="failed",
                     audio_path=str(audio_path),
                     error=str(exc),
                 )
             except Exception:
                 logger.exception(
-                    "Could not update failure status: %s",
+                    "Could not persist VAD failure: task=%s",
                     task_id,
                 )
 

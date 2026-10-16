@@ -1,0 +1,18 @@
+# Celery and Redis
+celery[redis]
+redis
+
+# Ray Serve
+ray[serve]
+
+# Audio processing and VAD
+torch
+silero-vad
+soundfile
+fireredvad[gpu]
+
+# Dataset loading
+datasets
+
+# YouTube audio downloading
+yt-dlp

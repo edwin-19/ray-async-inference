@@ -1,3 +1,4 @@
+
 services:
   redis:
     image: redis:7-alpine
@@ -6,7 +7,7 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     environment:
-      - REDIS_PASSWORD=mysecurepassword
+      REDIS_PASSWORD: mysecurepassword
     command: >
       sh -c 'redis-server
       --requirepass "$$REDIS_PASSWORD"
@@ -35,8 +36,29 @@ services:
       - rabbitmq_data:/var/lib/rabbitmq
       - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
 
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: inference
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: mypostgressecurepassword
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   redis_data:
     driver: local
   rabbitmq_data:
+    driver: local
+  postgres_data:
     driver: local
