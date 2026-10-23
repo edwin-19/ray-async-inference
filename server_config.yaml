@@ -1,0 +1,12 @@
+proxy_location: Disabled
+
+applications:
+  - name: main
+    route_prefix: null
+    import_path: main_consumer:app
+    deployments: []
+
+  - name: vad
+    route_prefix: null
+    import_path: vad_consumer:app
+    deployments: []

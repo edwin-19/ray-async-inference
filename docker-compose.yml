@@ -1,4 +1,3 @@
-
 services:
   redis:
     image: redis:7-alpine
@@ -7,20 +6,27 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     environment:
-      REDIS_PASSWORD: mysecurepassword
-    command: >
-      sh -c 'redis-server
-      --requirepass "$$REDIS_PASSWORD"
-      --appendonly yes
-      --maxmemory 512mb
-      --maxmemory-policy allkeys-lru'
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command:
+      - sh
+      - -c
+      - |
+        exec redis-server \
+          --requirepass "$$REDIS_PASSWORD" \
+          --appendonly yes \
+          --maxmemory 512mb \
+          --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      test:
+        - CMD-SHELL
+        - 'redis-cli --no-auth-warning -a "$$REDIS_PASSWORD" ping | grep -q PONG'
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - inference
 
   rabbitmq:
     image: rabbitmq:4-management-alpine
@@ -30,11 +36,21 @@ services:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: appuser
-      RABBITMQ_DEFAULT_PASS: myrabbitsecurepassword
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-appuser}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+      # Note: Make sure ./rabbitmq.conf exists locally if you keep this line, 
+      # or comment it out if you aren't using a custom config file.
       - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - inference
 
   postgres:
     image: postgres:17-alpine
@@ -43,17 +59,21 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     environment:
-      POSTGRES_DB: inference
-      POSTGRES_USER: appuser
-      POSTGRES_PASSWORD: mypostgressecurepassword
+      POSTGRES_DB: ${POSTGRES_DB:-inference}
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+    networks:
+      - inference
 
 volumes:
   redis_data:
@@ -62,3 +82,7 @@ volumes:
     driver: local
   postgres_data:
     driver: local
+
+networks:
+  inference:
+    driver: bridge
