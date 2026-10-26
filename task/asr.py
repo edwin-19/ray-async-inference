@@ -1,15 +1,19 @@
 
 import logging
 import os
+import tempfile
 import time
 from collections import Counter
 from itertools import islice
+from pathlib import Path
 from urllib.parse import quote
 from uuid import UUID
 
+import boto3
 import soundfile as sf
 import torch
 from dotenv import load_dotenv
+from celery import Celery
 from ray import serve
 from ray.serve.config import AutoscalingConfig
 from ray.serve.schema import CeleryAdapterConfig, TaskProcessorConfig
@@ -19,6 +23,11 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("asr.consumer")
+
+
+# ---------------------------------------------------------------------
+# Queue / model configuration
+# ---------------------------------------------------------------------
 
 ASR_QUEUE = os.getenv("ASR_QUEUE", "asr_queue")
 ALIGN_QUEUE = os.getenv("ALIGN_QUEUE", "align_queue")
@@ -37,10 +46,7 @@ def redis_url(db: int) -> str:
     password = os.getenv("REDIS_PASSWORD", "")
 
     if password:
-        return (
-            f"redis://:{quote(password, safe='')}"
-            f"@{host}:{port}/{db}"
-        )
+        return f"redis://:{quote(password, safe='')}@{host}:{port}/{db}"
 
     return f"redis://{host}:{port}/{db}"
 
@@ -56,6 +62,53 @@ processor_config = TaskProcessorConfig(
     ),
 )
 
+
+# ---------------------------------------------------------------------
+# MinIO configuration
+# ---------------------------------------------------------------------
+
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "speech-data")
+
+MINIO_ACCESS_KEY = os.getenv(
+    "MINIO_ACCESS_KEY",
+    os.getenv("MINIO_ROOT_USER", ""),
+)
+MINIO_SECRET_KEY = os.getenv(
+    "MINIO_SECRET_KEY",
+    os.getenv("MINIO_ROOT_PASSWORD", ""),
+)
+
+MINIO_SECURE = (
+    os.getenv("MINIO_SECURE", "false").lower() == "true"
+)
+
+
+def create_minio_client():
+    endpoint = MINIO_ENDPOINT.rstrip("/")
+
+    if not endpoint.startswith(("http://", "https://")):
+        scheme = "https" if MINIO_SECURE else "http"
+        endpoint = f"{scheme}://{endpoint}"
+
+    if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
+        raise ValueError(
+            "Set MINIO_ACCESS_KEY and MINIO_SECRET_KEY, "
+            "or MINIO_ROOT_USER and MINIO_ROOT_PASSWORD."
+        )
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=MINIO_ACCESS_KEY,
+        aws_secret_access_key=MINIO_SECRET_KEY,
+        region_name=os.getenv("MINIO_REGION", "us-east-1"),
+    )
+
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
 def batched(items, batch_size):
     iterator = iter(items)
@@ -80,6 +133,10 @@ def result_fields(result):
 
     return text, language
 
+
+# ---------------------------------------------------------------------
+# Ray Serve deployment
+# ---------------------------------------------------------------------
 
 @serve.deployment(
     name="asr-consumer",
@@ -121,7 +178,45 @@ class ASRConsumer:
             max_inference_batch_size=ASR_BATCH_SIZE,
         )
 
+        self.minio = create_minio_client()
+
         logger.info("ASR model loaded")
+        logger.info(
+            "MinIO configured: endpoint=%s bucket=%s",
+            MINIO_ENDPOINT,
+            MINIO_BUCKET,
+        )
+
+    def _download_audio(self, object_key: str) -> str:
+        """Download an audio object to a local temporary file."""
+        suffix = Path(object_key).suffix or ".audio"
+
+        fd, local_path = tempfile.mkstemp(
+            prefix="asr-",
+            suffix=suffix,
+        )
+        os.close(fd)
+
+        try:
+            self.minio.download_file(
+                MINIO_BUCKET,
+                object_key,
+                local_path,
+            )
+            logger.info(
+                "Downloaded audio from MinIO: bucket=%s key=%s",
+                MINIO_BUCKET,
+                object_key,
+            )
+            return local_path
+        except Exception:
+            Path(local_path).unlink(missing_ok=True)
+            logger.exception(
+                "MinIO download failed: bucket=%s key=%s",
+                MINIO_BUCKET,
+                object_key,
+            )
+            raise
 
     def _read_segment_batch(self, source, segments, sample_rate):
         audio_batch = []
@@ -202,26 +297,28 @@ class ASRConsumer:
         job_id = UUID(str(data["job_id"]))
         started = time.perf_counter()
 
-        # Import Celery here to avoid serializing publisher state
-        # into the Ray Serve deployment.
-        from celery import Celery
-
         publisher = Celery(
             "align_dispatch",
             broker=REDIS_BROKER_URL,
             backend=REDIS_BACKEND_URL,
         )
 
+        temp_audio_path = None
+
         try:
+            # ---------------------------------------------------------
+            # 1. Resolve the audio source and mark ASR as active
+            # ---------------------------------------------------------
             with Session(engine) as session:
-                job = session.exec(
-                    select(Job).where(Job.id == job_id)
-                ).first()
+                job = session.get(Job, job_id)
 
                 if job is None:
                     raise ValueError(f"Job not found: {job_id}")
 
-                if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                if job.status in (
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                ):
                     logger.info(
                         "Skipping terminal job=%s status=%s",
                         job_id,
@@ -232,12 +329,11 @@ class ASRConsumer:
                         "status": job.status.value,
                     }
 
-                audio_path = job.audio_path
-
-                if not os.path.isfile(audio_path):
-                    raise FileNotFoundError(
-                        f"Audio file not found: {audio_path}"
-                    )
+                audio_object_key = (
+                    getattr(job, "audio_object_key", None)
+                    or data.get("audio_object_key")
+                )
+                legacy_audio_path = getattr(job, "audio_path", None)
 
                 job.status = JobStatus.PROCESSING
                 job.stage = JobStage.ASR
@@ -250,6 +346,29 @@ class ASRConsumer:
                 session.add(job)
                 session.commit()
 
+            # Prefer MinIO. Keep local-path support for older jobs.
+            if audio_object_key:
+                temp_audio_path = self._download_audio(
+                    str(audio_object_key)
+                )
+                audio_path = Path(temp_audio_path)
+            elif legacy_audio_path:
+                audio_path = Path(legacy_audio_path)
+            else:
+                raise ValueError(
+                    f"Job {job_id} has neither audio_object_key "
+                    "nor audio_path"
+                )
+
+            if not audio_path.is_file():
+                raise FileNotFoundError(
+                    f"Audio file not found: {audio_path}"
+                )
+
+            # ---------------------------------------------------------
+            # 2. Load VAD segments and identify unfinished work
+            # ---------------------------------------------------------
+            with Session(engine) as session:
                 segments = session.exec(
                     select(TranscriptSegment)
                     .where(TranscriptSegment.job_id == job_id)
@@ -262,8 +381,9 @@ class ASRConsumer:
                     )
 
                 total_segments = len(segments)
-                pending = [
-                    segment for segment in segments
+                pending_indexes = [
+                    segment.segment_index
+                    for segment in segments
                     if segment.text is None
                 ]
 
@@ -271,51 +391,88 @@ class ASRConsumer:
                     "ASR job=%s total=%d pending=%d batch_size=%d",
                     job_id,
                     total_segments,
-                    len(pending),
+                    len(pending_indexes),
                     ASR_BATCH_SIZE,
                 )
 
+                # -----------------------------------------------------
+                # 3. Run ASR in batches, committing each batch
+                # -----------------------------------------------------
                 with sf.SoundFile(str(audio_path)) as source:
                     sample_rate = source.samplerate
 
-                    for batch_number, batch in enumerate(
-                        batched(pending, ASR_BATCH_SIZE),
+                    for batch_number, batch_indexes in enumerate(
+                        batched(pending_indexes, ASR_BATCH_SIZE),
                         start=1,
                     ):
                         batch_started = time.perf_counter()
 
+                        # Re-read current segment rows for this batch.
+                        batch_segments = session.exec(
+                            select(TranscriptSegment)
+                            .where(
+                                TranscriptSegment.job_id == job_id,
+                                TranscriptSegment.segment_index.in_(
+                                    batch_indexes
+                                ),
+                            )
+                            .order_by(TranscriptSegment.segment_index)
+                        ).all()
+
+                        # Another retry may have completed some segments.
+                        batch_segments = [
+                            segment for segment in batch_segments
+                            if segment.text is None
+                        ]
+
+                        if not batch_segments:
+                            continue
+
                         audio_batch = self._read_segment_batch(
-                            source, batch, sample_rate
+                            source,
+                            batch_segments,
+                            sample_rate,
                         )
                         results = self._transcribe_batch(audio_batch)
 
                         for segment, (text, language) in zip(
-                            batch, results
+                            batch_segments, results
                         ):
                             segment.text = text
                             segment.language = language
                             session.add(segment)
 
+                        job = session.get(Job, job_id)
+                        if job is None:
+                            raise RuntimeError(
+                                f"Job disappeared during ASR: {job_id}"
+                            )
+
                         job.updated_at = utc_now()
                         session.add(job)
                         session.commit()
 
-                        completed_count = total_segments - sum(
-                            segment.text is None
-                            for segment in segments
-                        )
+                        completed_count = session.exec(
+                            select(TranscriptSegment).where(
+                                TranscriptSegment.job_id == job_id,
+                                TranscriptSegment.text.is_not(None),
+                            )
+                        ).all()
 
                         logger.info(
                             "ASR progress job=%s batch=%d "
                             "completed=%d/%d elapsed=%.2fs",
                             job_id,
                             batch_number,
-                            completed_count,
+                            len(completed_count),
                             total_segments,
                             time.perf_counter() - batch_started,
                         )
 
-                # Reload persisted results before finalization.
+            # ---------------------------------------------------------
+            # 4. Verify all segments and finalize transcript
+            # ---------------------------------------------------------
+            with Session(engine) as session:
                 final_segments = session.exec(
                     select(TranscriptSegment)
                     .where(TranscriptSegment.job_id == job_id)
@@ -346,9 +503,7 @@ class ASRConsumer:
                     if segment.language
                 )
 
-                job = session.exec(
-                    select(Job).where(Job.id == job_id)
-                ).first()
+                job = session.get(Job, job_id)
 
                 if job is None:
                     raise RuntimeError(
@@ -361,8 +516,6 @@ class ASRConsumer:
                     if languages
                     else None
                 )
-
-                # Set the next stage before dispatching alignment.
                 job.status = JobStatus.PROCESSING
                 job.stage = JobStage.ALIGN
                 job.error = None
@@ -371,39 +524,42 @@ class ASRConsumer:
                 session.add(job)
                 session.commit()
 
-                # Publish only after the ASR results and stage are committed.
-                publisher.send_task(
-                    "process",
-                    args=[{"job_id": str(job_id)}],
-                    queue=ALIGN_QUEUE,
-                )
+            # ---------------------------------------------------------
+            # 5. Dispatch to alignment after committing ASR results
+            # ---------------------------------------------------------
+            align_task = publisher.send_task(
+                "process",
+                args=[{"job_id": str(job_id)}],
+                queue=ALIGN_QUEUE,
+            )
 
-                logger.info(
-                    "ASR completed job=%s; dispatched to queue=%s "
-                    "elapsed=%.2fs",
-                    job_id,
-                    ALIGN_QUEUE,
-                    time.perf_counter() - started,
-                )
+            logger.info(
+                "ASR completed job=%s; dispatched to queue=%s task_id=%s "
+                "elapsed=%.2fs",
+                job_id,
+                ALIGN_QUEUE,
+                align_task.id,
+                time.perf_counter() - started,
+            )
 
-                return {
-                    "job_id": str(job_id),
-                    "status": "processing",
-                    "stage": "align",
-                    "segments": total_segments,
-                }
+            return {
+                "job_id": str(job_id),
+                "status": "processing",
+                "stage": "align",
+                "segments": total_segments,
+                "next_queue": ALIGN_QUEUE,
+                "task_id": align_task.id,
+            }
 
         except Exception as exc:
             logger.exception("ASR failed job=%s", job_id)
 
-            # Preserve committed segment results for a future retry.
+            # Preserve committed segment results for retry.
             try:
                 with Session(engine) as session:
-                    job = session.exec(
-                        select(Job).where(Job.id == job_id)
-                    ).first()
+                    job = session.get(Job, job_id)
 
-                    if job is not None:
+                    if job is not None and job.status != JobStatus.COMPLETED:
                         job.status = JobStatus.PROCESSING
                         job.stage = JobStage.ASR
                         job.error = str(exc)[:4000]
@@ -413,10 +569,21 @@ class ASRConsumer:
 
             except Exception:
                 logger.exception(
-                    "Could not persist ASR error for job=%s", job_id
+                    "Could not persist ASR error for job=%s",
+                    job_id,
                 )
 
             raise
+
+        finally:
+            publisher.close()
+
+            if temp_audio_path:
+                Path(temp_audio_path).unlink(missing_ok=True)
+                logger.info(
+                    "Cleaned up temporary audio job_id=%s",
+                    job_id,
+                )
 
 
 app = ASRConsumer.bind()

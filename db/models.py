@@ -34,21 +34,33 @@ class JobStage(str, Enum):
     COMPLETED = "completed"
 
 
+
 class Job(SQLModel, table=True):
     __tablename__ = "jobs"
 
     id: UUID = Field(primary_key=True)
-    audio_path: str = Field(nullable=False)
+
+    # Legacy local path; retained during migration.
+    audio_path: Optional[str] = Field(default=None)
+
+    # MinIO object key, e.g. audio/<job_id>/source.wav.
+    audio_object_key: Optional[str] = Field(
+        default=None,
+        index=True,
+    )
 
     status: JobStatus = Field(default=JobStatus.QUEUED, index=True)
     stage: JobStage = Field(default=JobStage.MAIN)
 
     duration_seconds: Optional[float] = Field(default=None)
+
     transcript: Optional[str] = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
     )
+
     language: Optional[str] = Field(default=None)
+
     error: Optional[str] = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
@@ -59,14 +71,17 @@ class Job(SQLModel, table=True):
         sa_type=DateTime(timezone=True),
         index=True,
     )
+
     started_at: Optional[datetime] = Field(
         default=None,
         sa_type=DateTime(timezone=True),
     )
+
     completed_at: Optional[datetime] = Field(
         default=None,
         sa_type=DateTime(timezone=True),
     )
+
     updated_at: datetime = Field(
         default_factory=utc_now,
         sa_type=DateTime(timezone=True),

@@ -1,10 +1,12 @@
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 from urllib.parse import quote
 from uuid import UUID
 
+import boto3
 from dotenv import load_dotenv
 from celery import Celery
 from ray import serve
@@ -52,6 +54,49 @@ processor_config = TaskProcessorConfig(
 
 
 # ---------------------------------------------------------------------
+# MinIO configuration
+# ---------------------------------------------------------------------
+
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "speech-data")
+
+MINIO_ACCESS_KEY = os.getenv(
+    "MINIO_ACCESS_KEY",
+    os.getenv("MINIO_ROOT_USER", ""),
+)
+MINIO_SECRET_KEY = os.getenv(
+    "MINIO_SECRET_KEY",
+    os.getenv("MINIO_ROOT_PASSWORD", ""),
+)
+
+MINIO_SECURE = (
+    os.getenv("MINIO_SECURE", "false").lower() == "true"
+)
+
+
+def create_minio_client():
+    endpoint = MINIO_ENDPOINT.rstrip("/")
+
+    if not endpoint.startswith(("http://", "https://")):
+        scheme = "https" if MINIO_SECURE else "http"
+        endpoint = f"{scheme}://{endpoint}"
+
+    if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
+        raise ValueError(
+            "Set MINIO_ACCESS_KEY and MINIO_SECRET_KEY, "
+            "or MINIO_ROOT_USER and MINIO_ROOT_PASSWORD."
+        )
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=MINIO_ACCESS_KEY,
+        aws_secret_access_key=MINIO_SECRET_KEY,
+        region_name=os.getenv("MINIO_REGION", "us-east-1"),
+    )
+
+
+# ---------------------------------------------------------------------
 # FireRedVAD configuration
 # ---------------------------------------------------------------------
 
@@ -78,8 +123,6 @@ VAD_MODEL_PATH = Path(
 class VadConsumer:
 
     def __init__(self):
-        # Load the model inside the Ray replica rather than creating
-        # a model instance at module scope.
         from fireredvad import FireRedVad, FireRedVadConfig
 
         if not VAD_MODEL_PATH.is_dir():
@@ -104,11 +147,49 @@ class VadConsumer:
             config,
         )
 
+        # Initialize clients within the Ray replica.
+        self.minio = create_minio_client()
+
         logger.info("FireRedVAD loaded from %s", VAD_MODEL_PATH)
+        logger.info(
+            "MinIO configured: endpoint=%s bucket=%s",
+            MINIO_ENDPOINT,
+            MINIO_BUCKET,
+        )
+
+    def _download_audio(self, object_key: str) -> str:
+        """Download an audio object to a local temporary file."""
+        suffix = Path(object_key).suffix or ".audio"
+
+        fd, local_path = tempfile.mkstemp(
+            prefix="vad-",
+            suffix=suffix,
+        )
+        os.close(fd)
+
+        try:
+            self.minio.download_file(
+                MINIO_BUCKET,
+                object_key,
+                local_path,
+            )
+            logger.info(
+                "Downloaded audio from MinIO: bucket=%s key=%s",
+                MINIO_BUCKET,
+                object_key,
+            )
+            return local_path
+        except Exception:
+            Path(local_path).unlink(missing_ok=True)
+            logger.exception(
+                "MinIO download failed: bucket=%s key=%s",
+                MINIO_BUCKET,
+                object_key,
+            )
+            raise
 
     @task_handler(name="process")
     def process(self, data):
-        from sqlalchemy.exc import SQLAlchemyError
         from sqlmodel import Session, select
 
         from db.db import engine
@@ -137,7 +218,7 @@ class VadConsumer:
         logger.info("Received VAD job_id=%s", job_id)
 
         # -------------------------------------------------------------
-        # 1. Read and validate the job
+        # 1. Read job and resolve audio source
         # -------------------------------------------------------------
         with Session(engine) as session:
             job = session.get(Job, job_id)
@@ -157,139 +238,183 @@ class VadConsumer:
                     "status": "already_failed",
                 }
 
-            audio_path = Path(job.audio_path)
-
-        if not audio_path.is_file():
-            raise FileNotFoundError(
-                f"Audio file not found: {audio_path}"
+            audio_object_key = (
+                getattr(job, "audio_object_key", None)
+                or data.get("audio_object_key")
             )
+            legacy_audio_path = getattr(job, "audio_path", None)
 
-        # -------------------------------------------------------------
-        # 2. Run FireRedVAD
-        # -------------------------------------------------------------
-        logger.info(
-            "Running FireRedVAD job_id=%s audio=%s",
-            job_id,
-            audio_path,
-        )
-
-        result, _ = self.vad_model.detect(str(audio_path))
-
-        duration_seconds = float(result["dur"])
-        timestamps = result["timestamps"]
-
-        segments = []
-
-        for index, timestamp in enumerate(timestamps):
-            start_seconds = float(timestamp[0])
-            end_seconds = float(timestamp[1])
-
-            if start_seconds < 0 or end_seconds < start_seconds:
-                raise ValueError(
-                    f"Invalid VAD timestamps at segment {index}: "
-                    f"{start_seconds}-{end_seconds}"
-                )
-
-            segments.append(
-                {
-                    "segment_index": index,
-                    "start_seconds": start_seconds,
-                    "end_seconds": end_seconds,
-                }
-            )
-
-        logger.info(
-            "VAD complete job_id=%s duration=%.2fs segments=%d",
-            job_id,
-            duration_seconds,
-            len(segments),
-        )
-
-        # -------------------------------------------------------------
-        # 3. Persist duration and segments in one DB transaction
-        # -------------------------------------------------------------
-        with Session(engine) as session:
-            job = session.get(Job, job_id)
-
-            if job is None:
-                raise ValueError(f"Job disappeared: {job_id}")
-
-            if job.status == JobStatus.COMPLETED:
-                return {
-                    "job_id": str(job_id),
-                    "status": "already_completed",
-                }
-
-            # Make retries idempotent: replace the previous VAD output.
-            existing_segments = session.exec(
-                select(TranscriptSegment).where(
-                    TranscriptSegment.job_id == job_id
-                )
-            ).all()
-
-            for segment in existing_segments:
-                session.delete(segment)
-
-            job.duration_seconds = duration_seconds
             job.status = JobStatus.PROCESSING
             job.stage = JobStage.VAD
-            job.error = None
+
+            if job.started_at is None:
+                job.started_at = utc_now()
+
             job.updated_at = utc_now()
-
             session.add(job)
-
-            for segment in segments:
-                session.add(
-                    TranscriptSegment(
-                        job_id=job_id,
-                        segment_index=segment["segment_index"],
-                        start_seconds=segment["start_seconds"],
-                        end_seconds=segment["end_seconds"],
-                    )
-                )
-
-            # ASR must not be dispatched before this commit succeeds.
             session.commit()
 
-        logger.info(
-            "Persisted VAD results job_id=%s segments=%d",
-            job_id,
-            len(segments),
-        )
-
-        # -------------------------------------------------------------
-        # 4. Publish to ASR only after the DB transaction has committed
-        # -------------------------------------------------------------
-        publisher = Celery(
-            "speech_pipeline_publisher",
-            broker=REDIS_BROKER_URL,
-            backend=REDIS_BACKEND_URL,
-        )
+        temp_audio_path = None
 
         try:
-            asr_task = publisher.send_task(
-                "process",
-                args=[{"job_id": str(job_id)}],
-                queue=ASR_QUEUE_NAME,
+            # ---------------------------------------------------------
+            # 2. Download audio or use a legacy local file
+            # ---------------------------------------------------------
+            if audio_object_key:
+                temp_audio_path = self._download_audio(
+                    str(audio_object_key)
+                )
+                audio_path = Path(temp_audio_path)
+            elif legacy_audio_path:
+                audio_path = Path(legacy_audio_path)
+            else:
+                raise ValueError(
+                    f"Job {job_id} has neither audio_object_key "
+                    "nor audio_path"
+                )
+
+            if not audio_path.is_file():
+                raise FileNotFoundError(
+                    f"Audio file not found: {audio_path}"
+                )
+
+            # ---------------------------------------------------------
+            # 3. Run FireRedVAD
+            # ---------------------------------------------------------
+            logger.info(
+                "Running FireRedVAD job_id=%s audio=%s",
+                job_id,
+                audio_path,
             )
+
+            result, _ = self.vad_model.detect(str(audio_path))
+
+            duration_seconds = float(result["dur"])
+            timestamps = result["timestamps"]
+
+            segments = []
+
+            for index, timestamp in enumerate(timestamps):
+                start_seconds = float(timestamp[0])
+                end_seconds = float(timestamp[1])
+
+                if (
+                    start_seconds < 0
+                    or end_seconds < start_seconds
+                    or end_seconds > duration_seconds + 1.0
+                ):
+                    raise ValueError(
+                        f"Invalid VAD timestamps at segment {index}: "
+                        f"{start_seconds}-{end_seconds}; "
+                        f"duration={duration_seconds}"
+                    )
+
+                segments.append(
+                    {
+                        "segment_index": index,
+                        "start_seconds": start_seconds,
+                        "end_seconds": end_seconds,
+                    }
+                )
+
+            logger.info(
+                "VAD complete job_id=%s duration=%.2fs segments=%d",
+                job_id,
+                duration_seconds,
+                len(segments),
+            )
+
+            # ---------------------------------------------------------
+            # 4. Persist duration and segments atomically
+            # ---------------------------------------------------------
+            with Session(engine) as session:
+                job = session.get(Job, job_id)
+
+                if job is None:
+                    raise ValueError(f"Job disappeared: {job_id}")
+
+                if job.status == JobStatus.COMPLETED:
+                    return {
+                        "job_id": str(job_id),
+                        "status": "already_completed",
+                    }
+
+                existing_segments = session.exec(
+                    select(TranscriptSegment).where(
+                        TranscriptSegment.job_id == job_id
+                    )
+                ).all()
+
+                for segment in existing_segments:
+                    session.delete(segment)
+
+                job.duration_seconds = duration_seconds
+                job.status = JobStatus.PROCESSING
+                job.stage = JobStage.VAD
+                job.error = None
+                job.updated_at = utc_now()
+
+                session.add(job)
+
+                for segment in segments:
+                    session.add(
+                        TranscriptSegment(
+                            job_id=job_id,
+                            segment_index=segment["segment_index"],
+                            start_seconds=segment["start_seconds"],
+                            end_seconds=segment["end_seconds"],
+                        )
+                    )
+
+                session.commit()
+
+            logger.info(
+                "Persisted VAD results job_id=%s segments=%d",
+                job_id,
+                len(segments),
+            )
+
+            # ---------------------------------------------------------
+            # 5. Dispatch to ASR after the database commit
+            # ---------------------------------------------------------
+            publisher = Celery(
+                "speech_pipeline_publisher",
+                broker=REDIS_BROKER_URL,
+                backend=REDIS_BACKEND_URL,
+            )
+
+            try:
+                asr_task = publisher.send_task(
+                    "process",
+                    args=[{"job_id": str(job_id)}],
+                    queue=ASR_QUEUE_NAME,
+                )
+            finally:
+                publisher.close()
+
+            logger.info(
+                "Dispatched job_id=%s to queue=%s task_id=%s",
+                job_id,
+                ASR_QUEUE_NAME,
+                asr_task.id,
+            )
+
+            return {
+                "job_id": str(job_id),
+                "status": "dispatched",
+                "duration_seconds": duration_seconds,
+                "segments": len(segments),
+                "next_queue": ASR_QUEUE_NAME,
+                "task_id": asr_task.id,
+            }
+
         finally:
-            publisher.close()
-
-        logger.info(
-            "Dispatched job_id=%s to queue=%s task_id=%s",
-            job_id,
-            ASR_QUEUE_NAME,
-            asr_task.id,
-        )
-
-        return {
-            "job_id": str(job_id),
-            "status": "dispatched",
-            "duration_seconds": duration_seconds,
-            "segments": len(segments),
-            "next_queue": ASR_QUEUE_NAME,
-            "task_id": asr_task.id,
-        }
+            if temp_audio_path:
+                Path(temp_audio_path).unlink(missing_ok=True)
+                logger.info(
+                    "Cleaned up temporary audio job_id=%s",
+                    job_id,
+                )
 
 
 app = VadConsumer.bind()
