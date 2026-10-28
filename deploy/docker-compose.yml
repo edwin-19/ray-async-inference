@@ -1,0 +1,96 @@
+
+services:
+  vad-consumer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile-vad
+    image: speech-vad:latest
+    container_name: vad-consumer
+    restart: unless-stopped
+
+    command: ["serve", "run", "task.vad_consumer:app"]
+
+    env_file:
+      - ../.env
+
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+
+    working_dir: /app
+    gpus: all
+    shm_size: "4gb"
+    network_mode: host
+
+  asr-consumer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile-asr
+
+    image: speech-asr:latest
+    container_name: asr-consumer
+    restart: unless-stopped
+
+    network_mode: host
+    gpus: all
+    shm_size: "4gb"
+    working_dir: /app
+
+    env_file:
+      - ../.env
+
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+
+      # Redis running directly on the host
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+
+      # MinIO running directly on the host
+      MINIO_ENDPOINT: 127.0.0.1:9000
+
+      # Qwen model and inference settings
+      ASR_MODEL_NAME: Qwen/Qwen3-ASR-1.7B
+      ASR_NUM_GPUS_PER_REPLICA: "1"
+      ASR_NUM_CPUS_PER_REPLICA: "2"
+
+      HF_HOME: /root/.cache/huggingface
+
+    command: ["serve", "run", "task.asr:app"]
+
+
+  align-consumer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile-align
+
+    image: speech-align:latest
+    container_name: align-consumer
+    restart: unless-stopped
+
+    network_mode: host
+    gpus: all
+    shm_size: "4gb"
+    working_dir: /app
+
+    env_file:
+      - ../.env
+
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+
+      MINIO_ENDPOINT: 127.0.0.1:9000
+
+      ALIGN_MODEL_NAME: Qwen/Qwen3-ForcedAligner-0.6B
+      ALIGN_BATCH_SIZE: "4"
+      ALIGN_NUM_GPUS_PER_REPLICA: "1"
+      ALIGN_NUM_CPUS_PER_REPLICA: "1"
+
+      HF_HOME: /root/.cache/huggingface
+
+    command: ["serve", "run", "task.align_consumer:app"]

@@ -1,0 +1,11 @@
+
+qwen-asr
+ray[serve]==2.59.0
+celery[redis]
+redis
+sqlmodel
+psycopg[binary]
+boto3
+python-dotenv
+soundfile
+numpy

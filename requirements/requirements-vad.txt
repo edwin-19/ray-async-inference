@@ -1,0 +1,23 @@
+
+# FireRedVAD
+fireredvad[gpu]
+huggingface_hub
+
+# Task queue
+celery[redis]
+redis
+
+# Database
+sqlmodel
+psycopg[binary]
+
+# MinIO / S3-compatible storage
+boto3
+
+# Environment variables
+python-dotenv
+
+# Audio processing
+numpy
+soundfile
+ray[serve]

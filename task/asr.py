@@ -154,38 +154,41 @@ def result_fields(result):
 @task_consumer(task_processor_config=processor_config)
 class ASRConsumer:
 
+    
     def __init__(self):
         from qwen_asr import Qwen3ASRModel
 
-        if torch.cuda.is_available():
-            device = "cuda:0"
-            dtype = torch.float16
-        else:
-            device = "cpu"
-            dtype = torch.float32
-
-        logger.info(
-            "Loading ASR model=%s device=%s batch_size=%d",
-            ASR_MODEL_NAME,
-            device,
-            ASR_BATCH_SIZE,
+        gpu_memory_utilization = float(
+            os.getenv("ASR_GPU_MEMORY_UTILIZATION", "0.85")
         )
 
-        self.model = Qwen3ASRModel.from_pretrained(
+        logger.info(
+            "Loading ASR model=%s backend=vLLM batch_size=%d "
+            "gpu_memory_utilization=%.2f",
             ASR_MODEL_NAME,
-            dtype=dtype,
-            device_map=device,
+            ASR_BATCH_SIZE,
+            gpu_memory_utilization,
+        )
+
+        self.model = Qwen3ASRModel.LLM(
+            model=ASR_MODEL_NAME,
             max_inference_batch_size=ASR_BATCH_SIZE,
+            max_model_len=5096,
+            max_new_tokens=1028,
+            dtype="float16",
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_num_seqs=ASR_BATCH_SIZE,
         )
 
         self.minio = create_minio_client()
 
-        logger.info("ASR model loaded")
+        logger.info("vLLM ASR model loaded")
         logger.info(
             "MinIO configured: endpoint=%s bucket=%s",
             MINIO_ENDPOINT,
             MINIO_BUCKET,
         )
+
 
     def _download_audio(self, object_key: str) -> str:
         """Download an audio object to a local temporary file."""

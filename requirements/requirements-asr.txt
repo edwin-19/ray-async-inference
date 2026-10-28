@@ -1,0 +1,24 @@
+
+qwen-asr[vllm]==0.0.6
+
+ray[serve]==2.59.0
+celery[redis]
+redis
+sqlmodel
+psycopg[binary]
+boto3
+python-dotenv
+soundfile
+numpy
+
+numpy==2.2.6
+librosa==0.11.0
+soundfile==0.14.0
+
+# 模型管理（本地权重加载元信息）
+huggingface_hub==0.36.2
+scipy==1.17.1
+scikit-learn==1.9.0
+modelscope==1.33.0
+
+torchcodec==0.9.1

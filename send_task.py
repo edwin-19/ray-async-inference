@@ -12,6 +12,7 @@ import boto3
 from celery import Celery
 from dotenv import load_dotenv
 from sqlmodel import Session, select
+import argparse
 
 load_dotenv()
 
@@ -108,16 +109,30 @@ def upload_audio(audio_path: str, job_id: UUID) -> str:
     return object_key
 
 
-def create_job(job_id: UUID, audio_object_key: str) -> str:
+
+def create_job(
+    job_id: UUID,
+    storage: str,
+    audio_path: str | None = None,
+    audio_object_key: str | None = None,
+) -> str:
     from db.db import engine
     from db.models import Job, JobStatus, JobStage, utc_now
+
+    if storage == "local" and not audio_path:
+        raise ValueError("audio_path is required for local storage")
+
+    if storage == "minio" and not audio_object_key:
+        raise ValueError("audio_object_key is required for MinIO storage")
 
     now = utc_now()
 
     job = Job(
         id=job_id,
-        audio_path=None,
-        audio_object_key=audio_object_key,
+        audio_path=audio_path if storage == "local" else None,
+        audio_object_key=(
+            audio_object_key if storage == "minio" else None
+        ),
         status=JobStatus.QUEUED,
         stage=JobStage.VAD,
         created_at=now,
@@ -129,12 +144,13 @@ def create_job(job_id: UUID, audio_object_key: str) -> str:
         session.commit()
 
     logger.info(
-        "Created job=%s audio_object_key=%s",
+        "Created job=%s storage=%s audio_path=%s object_key=%s",
         job_id,
+        storage,
+        audio_path,
         audio_object_key,
     )
     return str(job_id)
-
 
 def send_task(job_id: str) -> str:
     celery_app = Celery(
@@ -367,65 +383,75 @@ def print_results(job_id_str: str):
     print(f"Failed segments:    {failed_segments}")
     print(f"Words with timings: {len(word_rows)}")
 
-
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: python {sys.argv[0]} <audio_path>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Submit an audio file to the speech pipeline."
+    )
+    parser.add_argument("audio_path", help="Path to the source audio")
+    parser.add_argument(
+        "--storage",
+        choices=["local", "minio"],
+        default="local",
+        help="Audio storage mode (default: local)",
+    )
+    args = parser.parse_args()
 
-    audio_path = str(Path(sys.argv[1]).expanduser().resolve())
+    audio_path = str(
+        Path(args.audio_path).expanduser().resolve()
+    )
 
     if not Path(audio_path).is_file():
-        print(f"Error: audio file not found: {audio_path}")
-        sys.exit(1)
+        parser.error(f"Audio file not found: {audio_path}")
 
+    storage = args.storage
     job_id = uuid4()
     audio_object_key = None
 
-    # 1. Upload the source audio to MinIO.
+    # 1. Upload only when MinIO storage is selected.
+    if storage == "minio":
+        try:
+            audio_object_key = upload_audio(audio_path, job_id)
+        except Exception:
+            logger.exception("Failed to upload audio to MinIO")
+            sys.exit(1)
+
+    # 2. Create a job with the selected storage reference.
     try:
-        audio_object_key = upload_audio(audio_path, job_id)
+        create_job(
+            job_id=job_id,
+            storage=storage,
+            audio_path=audio_path if storage == "local" else None,
+            audio_object_key=audio_object_key,
+        )
     except Exception:
-        logger.exception("Failed to upload audio to MinIO")
+        logger.exception("Failed to create database job")
+        if audio_object_key:
+            logger.error(
+                "Uploaded object remains in MinIO: bucket=%s key=%s",
+                MINIO_BUCKET,
+                audio_object_key,
+            )
         sys.exit(1)
 
-    # 2. Create the DB job referencing the uploaded object.
-    try:
-        create_job(job_id, audio_object_key)
-    except Exception:
-        logger.exception(
-            "Failed to create database job. "
-            "Uploaded MinIO object: bucket=%s key=%s",
-            MINIO_BUCKET,
-            audio_object_key,
-        )
-        print(
-            "\nThe audio was uploaded, but job creation failed. "
-            "The MinIO object may need to be removed manually."
-        )
-        sys.exit(1)
-
-    # 3. Publish directly to vad_queue.
+    # 3. Publish directly to the VAD queue.
     try:
         task_id = send_task(str(job_id))
     except Exception:
         logger.exception(
-            "Failed to publish job_id=%s. "
-            "The database job and MinIO object remain available.",
-            job_id,
+            "Failed to publish job_id=%s", job_id
         )
-        print("\nTask publishing failed; the job remains in PostgreSQL.")
+        print("\nTask publishing failed; the database job remains.")
         print(f"Job ID: {job_id}")
-        print(f"MinIO key: {audio_object_key}")
         sys.exit(1)
 
     print("\nJob submitted successfully")
-    print(f"  Job ID:      {job_id}")
-    print(f"  Local audio: {audio_path}")
-    print(f"  MinIO bucket:{MINIO_BUCKET}")
-    print(f"  MinIO key:   {audio_object_key}")
-    print(f"  Task ID:     {task_id}")
-    print(f"  Queue:       {VAD_QUEUE}")
+    print(f"  Job ID:       {job_id}")
+    print(f"  Storage:      {storage}")
+    print(f"  Local audio:  {audio_path}")
+    print(f"  MinIO bucket: {MINIO_BUCKET if storage == 'minio' else '(unused)'}")
+    print(f"  MinIO key:    {audio_object_key or '(unused)'}")
+    print(f"  Task ID:      {task_id}")
+    print(f"  Queue:        {VAD_QUEUE}")
 
     # 4. Poll PostgreSQL and print final results.
     print(
