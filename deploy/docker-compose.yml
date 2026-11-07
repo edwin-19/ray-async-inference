@@ -16,24 +16,98 @@ services:
     environment:
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
+      VAD_MAX_ONGOING_REQUESTS: "4"
+      VAD_NUM_CPUS: "2"
+      VAD_MIN_REPLICAS: "1"
+      VAD_MAX_REPLICAS: "4"
+      VAD_TARGET_ONGOING_REQUESTS: "4"
 
     working_dir: /app
-    gpus: all
-    shm_size: "4gb"
+    shm_size: "8gb"
     network_mode: host
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
 
   asr-consumer:
     build:
       context: ..
       dockerfile: deploy/Dockerfile-asr
-
     image: speech-asr:latest
     container_name: asr-consumer
     restart: unless-stopped
 
     network_mode: host
-    gpus: all
-    shm_size: "4gb"
+    shm_size: "64gb"
+    working_dir: /app
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+
+    env_file:
+      - ../.env
+
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      MINIO_ENDPOINT: 127.0.0.1:9000
+
+      ASR_MODEL_NAME: Qwen/Qwen3-ASR-1.7B
+      ASR_NUM_GPUS_PER_REPLICA: "1"
+      ASR_NUM_CPUS_PER_REPLICA: "2"
+      ASR_BATCH_SIZE: "40"
+
+      HF_HOME: /root/.cache/huggingface
+
+    command: ["serve", "run", "task.asr:app"]
+    
+  vad-failed-consumer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile-asr
+    image: speech-asr:latest
+    container_name: vad-failed-consumer
+    restart: unless-stopped
+
+    network_mode: host
+    working_dir: /app
+
+    env_file:
+      - ../.env
+
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      VAD_FAILED_QUEUE: vad_failed_queue
+      VAD_FAILED_MAX_RETRIES: "3"
+      VAD_FAILED_NUM_CPUS: "0.2"
+
+    command: ["serve", "run", "task.vad_failed_consumer:app"]
+
+  asr-failed-consumer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile-asr
+    image: speech-asr:latest
+    container_name: asr-failed-consumer
+    restart: unless-stopped
+
+    network_mode: host
     working_dir: /app
 
     env_file:
@@ -43,36 +117,34 @@ services:
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
 
-      # Redis running directly on the host
       REDIS_HOST: 127.0.0.1
       REDIS_PORT: "6379"
 
-      # MinIO running directly on the host
-      MINIO_ENDPOINT: 127.0.0.1:9000
+      ASR_FAILED_QUEUE: asr_failed_queue
+      ASR_FAILED_MAX_RETRIES: "3"
 
-      # Qwen model and inference settings
-      ASR_MODEL_NAME: Qwen/Qwen3-ASR-1.7B
-      ASR_NUM_GPUS_PER_REPLICA: "1"
-      ASR_NUM_CPUS_PER_REPLICA: "2"
-
-      HF_HOME: /root/.cache/huggingface
-
-    command: ["serve", "run", "task.asr:app"]
+    command: ["serve", "run", "task.asr_failed_consumer:app"]
 
 
   align-consumer:
     build:
       context: ..
       dockerfile: deploy/Dockerfile-align
-
     image: speech-align:latest
     container_name: align-consumer
     restart: unless-stopped
 
     network_mode: host
-    gpus: all
-    shm_size: "4gb"
+    shm_size: "16gb"
     working_dir: /app
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2"]
+              capabilities: [gpu]
 
     env_file:
       - ../.env
@@ -83,13 +155,15 @@ services:
 
       REDIS_HOST: 127.0.0.1
       REDIS_PORT: "6379"
-
       MINIO_ENDPOINT: 127.0.0.1:9000
 
       ALIGN_MODEL_NAME: Qwen/Qwen3-ForcedAligner-0.6B
-      ALIGN_BATCH_SIZE: "4"
+      ALIGN_BATCH_SIZE: "16"
       ALIGN_NUM_GPUS_PER_REPLICA: "1"
       ALIGN_NUM_CPUS_PER_REPLICA: "1"
+      ALIGN_MIN_REPLICAS: "1"
+      ALIGN_MAX_REPLICAS: "4"
+      ALIGN_TARGET_ONGOING_REQUESTS: "4"
 
       HF_HOME: /root/.cache/huggingface
 

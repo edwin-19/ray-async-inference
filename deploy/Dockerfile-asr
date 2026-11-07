@@ -1,35 +1,44 @@
 
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+ARG VLLM_TAG=v0.14.0
+FROM vllm/vllm-openai:${VLLM_TAG}
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
+# Install uv without replacing the base image's Python/PyTorch stack
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/app \
+    PIP_NO_CACHE_DIR=1 \
     HF_HOME=/root/.cache/huggingface
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-dev \
-    build-essential \
-    git \
-    ffmpeg \
-    libsndfile1 \
-    ca-certificates \
+# Audio runtime libraries and build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ffmpeg \
+        git \
+        curl \
+        libsndfile1 \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-RUN ln -sf /usr/bin/python3 /usr/local/bin/python
 
 WORKDIR /app
 
-RUN python -m pip install --upgrade pip setuptools wheel
+# Install ASR and pipeline dependencies
+COPY requirements/requirements-asr.txt /requirements-asr.txt
 
-COPY requirements/requirements-asr.txt /app/requirements-asr.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --break-system-packages \
+        -r /requirements-asr.txt
 
-RUN python -m pip install -r /app/requirements-asr.txt
-
+# Copy Ray Serve consumer and supporting modules
 COPY . /app
+
+# Verify core runtime imports and CUDA visibility
+RUN python3 -c "import torch; import vllm; print('PyTorch:', torch.__version__); print('vLLM:', vllm.__version__); print('CUDA available:', torch.cuda.is_available())"
+
+# Override the base vLLM API-server entrypoint.
+# Start this container as a Ray Serve consumer instead.
+ENTRYPOINT []
 
 CMD ["serve", "run", "task.asr:app"]

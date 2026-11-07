@@ -59,6 +59,7 @@ class Job(SQLModel, table=True):
         sa_column=Column(Text, nullable=True),
     )
 
+    requested_language: Optional[str] = Field(default=None)
     language: Optional[str] = Field(default=None)
 
     error: Optional[str] = Field(

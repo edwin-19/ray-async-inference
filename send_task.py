@@ -1,4 +1,4 @@
-
+import argparse
 import logging
 import mimetypes
 import os
@@ -12,19 +12,28 @@ import boto3
 from celery import Celery
 from dotenv import load_dotenv
 from sqlmodel import Session, select
-import argparse
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_pipeline")
 
+
+# ---------------------------------------------------------------------
+# Pipeline configuration
+# ---------------------------------------------------------------------
+
 VAD_QUEUE = os.getenv("VAD_QUEUE", "vad_queue")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "5"))
 TIMEOUT_SECONDS = float(os.getenv("TIMEOUT_SECONDS", "6000"))
 
+# ---------------------------------------------------------------------
+# MinIO configuration
+# ---------------------------------------------------------------------
+
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "speech-data")
+
 MINIO_ACCESS_KEY = os.getenv(
     "MINIO_ACCESS_KEY",
     os.getenv("MINIO_ROOT_USER", ""),
@@ -33,10 +42,15 @@ MINIO_SECRET_KEY = os.getenv(
     "MINIO_SECRET_KEY",
     os.getenv("MINIO_ROOT_PASSWORD", ""),
 )
-MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() in {
-    "1", "true", "yes"
-}
 
+MINIO_SECURE = os.getenv(
+    "MINIO_SECURE", "false"
+).lower() in {"1", "true", "yes"}
+
+
+# ---------------------------------------------------------------------
+# Redis configuration
+# ---------------------------------------------------------------------
 
 def redis_url(db: int) -> str:
     host = os.getenv("REDIS_HOST", "127.0.0.1")
@@ -56,6 +70,10 @@ BROKER_URL = redis_url(0)
 BACKEND_URL = redis_url(1)
 
 
+# ---------------------------------------------------------------------
+# MinIO helpers
+# ---------------------------------------------------------------------
+
 def create_minio_client():
     if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
         raise RuntimeError(
@@ -64,13 +82,18 @@ def create_minio_client():
             "MINIO_ROOT_PASSWORD."
         )
 
-    scheme = "https" if MINIO_SECURE else "http"
+    endpoint = MINIO_ENDPOINT.rstrip("/")
+
+    if not endpoint.startswith(("http://", "https://")):
+        scheme = "https" if MINIO_SECURE else "http"
+        endpoint = f"{scheme}://{endpoint}"
 
     return boto3.client(
         "s3",
-        endpoint_url=f"{scheme}://{MINIO_ENDPOINT}",
+        endpoint_url=endpoint,
         aws_access_key_id=MINIO_ACCESS_KEY,
         aws_secret_access_key=MINIO_SECRET_KEY,
+        region_name=os.getenv("MINIO_REGION", "us-east-1"),
     )
 
 
@@ -79,13 +102,14 @@ def upload_audio(audio_path: str, job_id: UUID) -> str:
     path = Path(audio_path)
 
     if not path.is_file():
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        raise FileNotFoundError(
+            f"Audio file not found: {audio_path}"
+        )
 
     suffix = path.suffix or ".audio"
     object_key = f"audio/{job_id}/source{suffix}"
 
     minio = create_minio_client()
-
     content_type, _ = mimetypes.guess_type(str(path))
 
     extra_args = {}
@@ -98,32 +122,50 @@ def upload_audio(audio_path: str, job_id: UUID) -> str:
         object_key,
     )
 
+    upload_kwargs = {}
+    if extra_args:
+        upload_kwargs["ExtraArgs"] = extra_args
+
     minio.upload_file(
         str(path),
         MINIO_BUCKET,
         object_key,
-        ExtraArgs=extra_args or None,
+        **upload_kwargs,
     )
 
     logger.info("Audio uploaded successfully: %s", object_key)
     return object_key
 
 
+# ---------------------------------------------------------------------
+# Database job creation
+# ---------------------------------------------------------------------
 
 def create_job(
     job_id: UUID,
     storage: str,
     audio_path: str | None = None,
     audio_object_key: str | None = None,
+    requested_language: str | None = None,
 ) -> str:
     from db.db import engine
     from db.models import Job, JobStatus, JobStage, utc_now
 
     if storage == "local" and not audio_path:
-        raise ValueError("audio_path is required for local storage")
+        raise ValueError(
+            "audio_path is required for local storage"
+        )
 
     if storage == "minio" and not audio_object_key:
-        raise ValueError("audio_object_key is required for MinIO storage")
+        raise ValueError(
+            "audio_object_key is required for MinIO storage"
+        )
+
+    requested_language = (
+        requested_language.strip()
+        if requested_language
+        else None
+    )
 
     now = utc_now()
 
@@ -133,6 +175,7 @@ def create_job(
         audio_object_key=(
             audio_object_key if storage == "minio" else None
         ),
+        requested_language=requested_language,
         status=JobStatus.QUEUED,
         stage=JobStage.VAD,
         created_at=now,
@@ -144,13 +187,21 @@ def create_job(
         session.commit()
 
     logger.info(
-        "Created job=%s storage=%s audio_path=%s object_key=%s",
+        "Created job=%s storage=%s requested_language=%s "
+        "audio_path=%s object_key=%s",
         job_id,
         storage,
+        requested_language or "auto-detect",
         audio_path,
         audio_object_key,
     )
+
     return str(job_id)
+
+
+# ---------------------------------------------------------------------
+# Redis / Celery task submission
+# ---------------------------------------------------------------------
 
 def send_task(job_id: str) -> str:
     celery_app = Celery(
@@ -172,10 +223,16 @@ def send_task(job_id: str) -> str:
             VAD_QUEUE,
             job_id,
         )
+
         return result.id
+
     finally:
         celery_app.close()
 
+
+# ---------------------------------------------------------------------
+# Result helpers
+# ---------------------------------------------------------------------
 
 def enum_value(value):
     return value.value if hasattr(value, "value") else value
@@ -183,7 +240,11 @@ def enum_value(value):
 
 def print_results(job_id_str: str):
     from db.db import engine
-    from db.models import Job, TranscriptSegment, TranscriptWord
+    from db.models import (
+        Job,
+        TranscriptSegment,
+        TranscriptWord,
+    )
 
     job_id = UUID(job_id_str)
     deadline = time.monotonic() + TIMEOUT_SECONDS
@@ -215,16 +276,21 @@ def print_results(job_id_str: str):
             stage = enum_value(job.stage)
 
             transcribed = sum(
-                segment.text is not None for segment in segments
+                segment.text is not None
+                for segment in segments
             )
 
             aligned_segments = sum(
-                getattr(segment, "alignment_status", None) == "completed"
+                enum_value(
+                    getattr(segment, "alignment_status", None)
+                ) == "completed"
                 for segment in segments
             )
 
             failed_segments = sum(
-                getattr(segment, "alignment_status", None) == "failed"
+                enum_value(
+                    getattr(segment, "alignment_status", None)
+                ) == "failed"
                 for segment in segments
             )
 
@@ -242,7 +308,9 @@ def print_results(job_id_str: str):
             if status in ("completed", "failed"):
                 job_info = {
                     "id": job.id,
-                    "audio_path": getattr(job, "audio_path", None),
+                    "audio_path": getattr(
+                        job, "audio_path", None
+                    ),
                     "audio_object_key": getattr(
                         job, "audio_object_key", None
                     ),
@@ -250,6 +318,9 @@ def print_results(job_id_str: str):
                     "stage": stage,
                     "duration_seconds": job.duration_seconds,
                     "transcript": job.transcript,
+                    "requested_language": getattr(
+                        job, "requested_language", None
+                    ),
                     "language": job.language,
                     "error": job.error,
                     "created_at": job.created_at,
@@ -266,8 +337,12 @@ def print_results(job_id_str: str):
                         "end_seconds": segment.end_seconds,
                         "text": segment.text,
                         "language": segment.language,
-                        "alignment_status": getattr(
-                            segment, "alignment_status", "unknown"
+                        "alignment_status": enum_value(
+                            getattr(
+                                segment,
+                                "alignment_status",
+                                "unknown",
+                            )
                         ),
                     }
                     for segment in segments
@@ -298,20 +373,32 @@ def print_results(job_id_str: str):
         time.sleep(POLL_SECONDS)
 
     print("\n\n=== JOB ===")
-    print(f"Job ID:        {job_info['id']}")
-    print(f"Audio path:    {job_info['audio_path']}")
-    print(f"MinIO key:     {job_info['audio_object_key']}")
-    print(f"Status:        {job_info['status']}")
-    print(f"Stage:         {job_info['stage']}")
-    print(f"Duration:      {job_info['duration_seconds']} seconds")
-    print(f"Language:      {job_info['language']}")
-    print(f"Error:         {job_info['error']}")
-    print(f"Created:       {job_info['created_at']}")
-    print(f"Started:       {job_info['started_at']}")
-    print(f"Completed:     {job_info['completed_at']}")
-    print(f"Updated:       {job_info['updated_at']}")
+    print(f"Job ID:             {job_info['id']}")
+    print(f"Audio path:         {job_info['audio_path']}")
+    print(f"MinIO key:          {job_info['audio_object_key']}")
+    print(f"Status:             {job_info['status']}")
+    print(f"Stage:              {job_info['stage']}")
+    print(
+        f"Duration:           "
+        f"{job_info['duration_seconds']} seconds"
+    )
+    print(
+        f"Requested language: "
+        f"{job_info['requested_language'] or 'auto-detect'}"
+    )
+    print(
+        f"Detected language:  "
+        f"{job_info['language'] or 'unknown'}"
+    )
+    print(f"Error:              {job_info['error']}")
+    print(f"Created:            {job_info['created_at']}")
+    print(f"Started:            {job_info['started_at']}")
+    print(f"Completed:          {job_info['completed_at']}")
+    print(f"Updated:            {job_info['updated_at']}")
 
-    print(f"\n=== TRANSCRIPT SEGMENTS ({len(segment_rows)}) ===")
+    print(
+        f"\n=== TRANSCRIPT SEGMENTS ({len(segment_rows)}) ==="
+    )
 
     transcript_parts = []
 
@@ -347,17 +434,26 @@ def print_results(job_id_str: str):
         )
 
     print("\n=== COMBINED TRANSCRIPT ===")
-    print(" ".join(transcript_parts) or "(No transcript available)")
+    print(
+        " ".join(transcript_parts)
+        or "(No transcript available)"
+    )
 
-    print(f"\n=== WORD-LEVEL ALIGNMENT ({len(word_rows)} words) ===")
+    print(
+        f"\n=== WORD-LEVEL ALIGNMENT ({len(word_rows)} words) ==="
+    )
 
     words_by_segment = {}
 
     for word in word_rows:
-        words_by_segment.setdefault(word["segment_id"], []).append(word)
+        words_by_segment.setdefault(
+            word["segment_id"], []
+        ).append(word)
 
     for segment in segment_rows:
-        segment_words = words_by_segment.get(segment["id"], [])
+        segment_words = words_by_segment.get(
+            segment["id"], []
+        )
 
         if not segment_words:
             continue
@@ -383,17 +479,38 @@ def print_results(job_id_str: str):
     print(f"Failed segments:    {failed_segments}")
     print(f"Words with timings: {len(word_rows)}")
 
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
         description="Submit an audio file to the speech pipeline."
     )
-    parser.add_argument("audio_path", help="Path to the source audio")
+
+    parser.add_argument(
+        "audio_path",
+        help="Path to the source audio",
+    )
+
     parser.add_argument(
         "--storage",
         choices=["local", "minio"],
         default="local",
         help="Audio storage mode (default: local)",
     )
+
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help=(
+            "Requested ASR language, e.g. Japanese, English, "
+            "or Malay. Omit for automatic detection."
+        ),
+    )
+
     args = parser.parse_args()
 
     audio_path = str(
@@ -403,6 +520,12 @@ def main():
     if not Path(audio_path).is_file():
         parser.error(f"Audio file not found: {audio_path}")
 
+    requested_language = (
+        args.language.strip()
+        if args.language
+        else None
+    )
+
     storage = args.storage
     job_id = uuid4()
     audio_object_key = None
@@ -410,36 +533,51 @@ def main():
     # 1. Upload only when MinIO storage is selected.
     if storage == "minio":
         try:
-            audio_object_key = upload_audio(audio_path, job_id)
+            audio_object_key = upload_audio(
+                audio_path,
+                job_id,
+            )
         except Exception:
-            logger.exception("Failed to upload audio to MinIO")
+            logger.exception(
+                "Failed to upload audio to MinIO"
+            )
             sys.exit(1)
 
-    # 2. Create a job with the selected storage reference.
+    # 2. Create the database job.
     try:
         create_job(
             job_id=job_id,
             storage=storage,
-            audio_path=audio_path if storage == "local" else None,
+            audio_path=(
+                audio_path if storage == "local" else None
+            ),
             audio_object_key=audio_object_key,
+            requested_language=requested_language,
         )
+
     except Exception:
         logger.exception("Failed to create database job")
+
         if audio_object_key:
             logger.error(
-                "Uploaded object remains in MinIO: bucket=%s key=%s",
+                "Uploaded object remains in MinIO: "
+                "bucket=%s key=%s",
                 MINIO_BUCKET,
                 audio_object_key,
             )
+
         sys.exit(1)
 
     # 3. Publish directly to the VAD queue.
     try:
         task_id = send_task(str(job_id))
+
     except Exception:
         logger.exception(
-            "Failed to publish job_id=%s", job_id
+            "Failed to publish job_id=%s",
+            job_id,
         )
+
         print("\nTask publishing failed; the database job remains.")
         print(f"Job ID: {job_id}")
         sys.exit(1)
@@ -448,8 +586,12 @@ def main():
     print(f"  Job ID:       {job_id}")
     print(f"  Storage:      {storage}")
     print(f"  Local audio:  {audio_path}")
-    print(f"  MinIO bucket: {MINIO_BUCKET if storage == 'minio' else '(unused)'}")
+    print(
+        f"  MinIO bucket: "
+        f"{MINIO_BUCKET if storage == 'minio' else '(unused)'}"
+    )
     print(f"  MinIO key:    {audio_object_key or '(unused)'}")
+    print(f"  Language:     {requested_language or 'auto-detect'}")
     print(f"  Task ID:      {task_id}")
     print(f"  Queue:        {VAD_QUEUE}")
 
@@ -458,6 +600,7 @@ def main():
         f"\nWaiting for pipeline completion "
         f"(timeout={TIMEOUT_SECONDS}s)..."
     )
+
     print_results(str(job_id))
 
 

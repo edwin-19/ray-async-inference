@@ -44,12 +44,20 @@ REDIS_BACKEND_URL = redis_url(1)
 VAD_QUEUE_NAME = os.getenv("VAD_QUEUE", "vad_queue")
 ASR_QUEUE_NAME = os.getenv("ASR_QUEUE", "asr_queue")
 
+VAD_MAX_RETRIES = int(os.getenv("VAD_MAX_RETRIES", "3"))
+VAD_FAILED_QUEUE = os.getenv(
+    "VAD_FAILED_QUEUE",
+    "vad_failed_queue",
+)
+
 processor_config = TaskProcessorConfig(
     queue_name=VAD_QUEUE_NAME,
     adapter_config=CeleryAdapterConfig(
         broker_url=REDIS_BROKER_URL,
         backend_url=REDIS_BACKEND_URL,
     ),
+    max_retries=VAD_MAX_RETRIES,
+    failed_task_queue_name=VAD_FAILED_QUEUE,
 )
 
 
@@ -111,12 +119,16 @@ VAD_MODEL_PATH = Path(
 
 @serve.deployment(
     name="vad-consumer",
-    max_ongoing_requests=2,
-    ray_actor_options={"num_cpus": 2},
+    max_ongoing_requests=int(os.getenv("VAD_MAX_ONGOING_REQUESTS", "2")),
+    ray_actor_options={
+        "num_cpus": float(os.getenv("VAD_NUM_CPUS", "2")),
+    },
     autoscaling_config=AutoscalingConfig(
-        min_replicas=1,
-        max_replicas=2,
-        target_ongoing_requests=1,
+        min_replicas=int(os.getenv("VAD_MIN_REPLICAS", "1")),
+        max_replicas=int(os.getenv("VAD_MAX_REPLICAS", "2")),
+        target_ongoing_requests=int(
+            os.getenv("VAD_TARGET_ONGOING_REQUESTS", "1")
+        ),
     ),
 )
 @task_consumer(task_processor_config=processor_config)
@@ -133,11 +145,11 @@ class VadConsumer:
         config = FireRedVadConfig(
             use_gpu=True,
             smooth_window_size=5,
-            speech_threshold=0.4,
-            min_speech_frame=20,
-            max_speech_frame=2000,
+            speech_threshold=0.5,
+            min_speech_frame=10,
+            max_speech_frame=3000,
             min_silence_frame=20,
-            merge_silence_frame=0,
+            merge_silence_frame=10,
             extend_speech_frame=0,
             chunk_max_frame=30000,
         )
@@ -407,6 +419,33 @@ class VadConsumer:
                 "next_queue": ASR_QUEUE_NAME,
                 "task_id": asr_task.id,
             }
+
+        except Exception as exc:
+            logger.exception(
+                "VAD processing failed job_id=%s",
+                job_id,
+            )
+
+            try:
+                with Session(engine) as session:
+                    job = session.get(Job, job_id)
+
+                    if job is not None and job.status != JobStatus.COMPLETED:
+                        job.status = JobStatus.PROCESSING
+                        job.stage = JobStage.VAD
+                        job.error = str(exc)[:4000]
+                        job.updated_at = utc_now()
+
+                        session.add(job)
+                        session.commit()
+
+            except Exception:
+                logger.exception(
+                    "Failed to persist VAD error job_id=%s",
+                    job_id,
+                )
+
+            raise
 
         finally:
             if temp_audio_path:

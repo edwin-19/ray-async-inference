@@ -103,9 +103,11 @@ def batched(items, size):
         "num_gpus": ALIGN_NUM_GPUS,
     },
     autoscaling_config=AutoscalingConfig(
-        min_replicas=1,
-        max_replicas=1,
-        target_ongoing_requests=1,
+        min_replicas=int(os.getenv("ALIGN_MIN_REPLICAS", "1")),
+        max_replicas=int(os.getenv("ALIGN_MAX_REPLICAS", "1")),
+        target_ongoing_requests=int(
+            os.getenv("ALIGN_TARGET_ONGOING_REQUESTS", "1")
+        ),
     ),
 )
 @task_consumer(task_processor_config=processor_config)

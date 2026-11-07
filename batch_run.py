@@ -1,4 +1,3 @@
-
 import argparse
 import logging
 import mimetypes
@@ -30,6 +29,13 @@ def format_elapsed(seconds: float) -> str:
     return f"{hours}h {minutes}m {secs}s"
 
 
+AUDIO_STORAGE = os.getenv("AUDIO_STORAGE", "minio").lower()
+
+if AUDIO_STORAGE not in {"minio", "local"}:
+    raise ValueError(
+        "AUDIO_STORAGE must be either 'minio' or 'local'."
+    )
+
 VAD_QUEUE = os.getenv("VAD_QUEUE", "vad_queue")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "5"))
 TIMEOUT_SECONDS = float(os.getenv("TIMEOUT_SECONDS", "6000"))
@@ -43,7 +49,9 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY") or os.getenv(
     "MINIO_ROOT_PASSWORD", ""
 )
 MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() in {
-    "1", "true", "yes"
+    "1",
+    "true",
+    "yes",
 }
 
 
@@ -53,7 +61,10 @@ def redis_url(db: int) -> str:
     password = os.getenv("REDIS_PASSWORD", "")
 
     if password:
-        return f"redis://:{quote(password, safe='')}@{host}:{port}/{db}"
+        return (
+            f"redis://:{quote(password, safe='')}"
+            f"@{host}:{port}/{db}"
+        )
 
     return f"redis://{host}:{port}/{db}"
 
@@ -79,10 +90,15 @@ def create_minio_client():
 def upload_audio(audio_path: str, batch_id: UUID) -> str:
     """Upload the input audio once for all jobs in this batch."""
     path = Path(audio_path)
-    object_key = f"audio/batches/{batch_id}/source{path.suffix or '.audio'}"
+    object_key = (
+        f"audio/batches/{batch_id}/source"
+        f"{path.suffix or '.audio'}"
+    )
 
     content_type, _ = mimetypes.guess_type(str(path))
-    extra_args = {"ContentType": content_type} if content_type else {}
+    extra_args = (
+        {"ContentType": content_type} if content_type else None
+    )
 
     client = create_minio_client()
 
@@ -92,20 +108,35 @@ def upload_audio(audio_path: str, batch_id: UUID) -> str:
         object_key,
     )
 
+    upload_args = {}
+    if extra_args:
+        upload_args["ExtraArgs"] = extra_args
+
     client.upload_file(
         str(path),
         MINIO_BUCKET,
         object_key,
-        ExtraArgs=extra_args or None,
+        **upload_args,
     )
 
     logger.info("Upload complete: %s", object_key)
     return object_key
 
 
-def create_jobs(job_ids: list[UUID], audio_object_key: str):
+def create_jobs(
+    job_ids: list[UUID],
+    *,
+    audio_path: str | None = None,
+    audio_object_key: str | None = None,
+):
+    """Create jobs using exactly one audio source."""
     from db.db import engine
     from db.models import Job, JobStatus, JobStage, utc_now
+
+    if bool(audio_path) == bool(audio_object_key):
+        raise ValueError(
+            "Provide exactly one of audio_path or audio_object_key."
+        )
 
     now = utc_now()
 
@@ -114,7 +145,7 @@ def create_jobs(job_ids: list[UUID], audio_object_key: str):
             session.add(
                 Job(
                     id=job_id,
-                    audio_path=None,
+                    audio_path=audio_path,
                     audio_object_key=audio_object_key,
                     status=JobStatus.QUEUED,
                     stage=JobStage.VAD,
@@ -125,7 +156,11 @@ def create_jobs(job_ids: list[UUID], audio_object_key: str):
 
         session.commit()
 
-    logger.info("Created %d database jobs", len(job_ids))
+    logger.info(
+        "Created %d database jobs using %s storage",
+        len(job_ids),
+        "local" if audio_path else "minio",
+    )
 
 
 def send_tasks(job_ids: list[UUID]) -> dict[UUID, str]:
@@ -146,6 +181,7 @@ def send_tasks(job_ids: list[UUID]) -> dict[UUID, str]:
                     queue=VAD_QUEUE,
                 )
                 published[job_id] = result.id
+
                 logger.info(
                     "Published job=%s task=%s queue=%s",
                     job_id,
@@ -153,7 +189,10 @@ def send_tasks(job_ids: list[UUID]) -> dict[UUID, str]:
                     VAD_QUEUE,
                 )
             except Exception:
-                logger.exception("Failed to publish job=%s", job_id)
+                logger.exception(
+                    "Failed to publish job=%s",
+                    job_id,
+                )
     finally:
         celery_app.close()
 
@@ -188,6 +227,7 @@ def read_job_summary(job_ids: list[UUID]):
                 "audio_object_key": getattr(
                     job, "audio_object_key", None
                 ),
+                "audio_path": getattr(job, "audio_path", None),
                 "segments": 0,
                 "transcribed": 0,
                 "aligned": 0,
@@ -227,18 +267,24 @@ def wait_for_jobs(job_ids: list[UUID]):
         summary = read_job_summary(job_ids)
 
         completed = sum(
-            row["status"] == "completed" for row in summary.values()
+            row["status"] == "completed"
+            for row in summary.values()
         )
         failed = sum(
-            row["status"] == "failed" for row in summary.values()
+            row["status"] == "failed"
+            for row in summary.values()
         )
         terminal = completed + failed
 
-        total_segments = sum(row["segments"] for row in summary.values())
+        total_segments = sum(
+            row["segments"] for row in summary.values()
+        )
         transcribed = sum(
             row["transcribed"] for row in summary.values()
         )
-        aligned = sum(row["aligned"] for row in summary.values())
+        aligned = sum(
+            row["aligned"] for row in summary.values()
+        )
         alignment_failed = sum(
             row["alignment_failed"] for row in summary.values()
         )
@@ -278,6 +324,9 @@ def print_summary(
     summary: dict,
     published: dict[UUID, str],
     finished: bool,
+    storage: str,
+    audio_path: str | None = None,
+    audio_object_key: str | None = None,
 ):
     from db.db import engine
     from db.models import TranscriptWord
@@ -302,22 +351,35 @@ def print_summary(
     print(f"Tasks published:      {len(published)}")
     print(f"Jobs found in DB:     {len(summary)}")
     print(
-        f"Completed:            "
+        "Completed:            "
         f"{sum(r['status'] == 'completed' for r in summary.values())}"
     )
     print(
-        f"Failed:               "
+        "Failed:               "
         f"{sum(r['status'] == 'failed' for r in summary.values())}"
     )
     print(f"Timed out:            {not finished}")
-    print(f"MinIO bucket:         {MINIO_BUCKET}")
+    print(f"Storage:              {storage}")
+
+    if storage == "minio":
+        print(f"MinIO bucket:         {MINIO_BUCKET}")
+        print(f"MinIO object:         {audio_object_key}")
+    else:
+        print(f"Local audio path:     {audio_path}")
+
     print(f"Queue:                {VAD_QUEUE}")
 
-    total_segments = sum(r["segments"] for r in summary.values())
-    total_transcribed = sum(r["transcribed"] for r in summary.values())
-    total_aligned = sum(r["aligned"] for r in summary.values())
+    total_segments = sum(
+        row["segments"] for row in summary.values()
+    )
+    total_transcribed = sum(
+        row["transcribed"] for row in summary.values()
+    )
+    total_aligned = sum(
+        row["aligned"] for row in summary.values()
+    )
     total_alignment_failed = sum(
-        r["alignment_failed"] for r in summary.values()
+        row["alignment_failed"] for row in summary.values()
     )
     total_words = sum(word_counts.values())
 
@@ -366,8 +428,6 @@ def print_summary(
 
 
 def main():
-    global POLL_SECONDS, TIMEOUT_SECONDS
-
     parser = argparse.ArgumentParser(
         description=(
             "Submit one or more audio jobs to the "
@@ -383,6 +443,24 @@ def main():
         type=int,
         default=1,
         help="Number of jobs using the same audio (default: 1)",
+    )
+    parser.add_argument(
+        "--storage",
+        choices=["minio", "local"],
+        default=AUDIO_STORAGE,
+        help=(
+            "Audio storage mode "
+            "(default: AUDIO_STORAGE or minio)"
+        ),
+    )
+    parser.add_argument(
+        "--local-audio-path",
+        default=None,
+        help=(
+            "Path stored in the database for local mode. "
+            "Must be accessible at this exact path by consumers. "
+            "Defaults to the resolved input audio path."
+        ),
     )
     parser.add_argument(
         "--no-wait",
@@ -413,12 +491,12 @@ def main():
 
     args = parser.parse_args()
 
-    audio_path = str(
+    source_path = str(
         Path(args.audio_path).expanduser().resolve()
     )
 
-    if not Path(audio_path).is_file():
-        parser.error(f"Audio file not found: {audio_path}")
+    if not Path(source_path).is_file():
+        parser.error(f"Audio file not found: {source_path}")
 
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
@@ -429,29 +507,59 @@ def main():
     if args.audio_hours_per_job <= 0:
         parser.error("--audio-hours-per-job must be positive")
 
-    POLL_SECONDS = args.poll_seconds
-    TIMEOUT_SECONDS = args.timeout_seconds
-
-    # Start before upload to measure the entire end-to-end run.
-    run_started = time.monotonic()
-
     batch_id = uuid4()
     job_ids = [uuid4() for _ in range(args.jobs)]
+    run_started = time.monotonic()
+
+    audio_object_key = None
+    db_audio_path = None
+
+    if args.storage == "minio":
+        try:
+            audio_object_key = upload_audio(source_path, batch_id)
+        except Exception:
+            logger.exception("Failed to upload audio to MinIO")
+            raise SystemExit(1)
+    else:
+        db_audio_path = str(
+            Path(
+                args.local_audio_path or source_path
+            ).expanduser().resolve()
+        )
+
+        logger.info("Using local audio path: %s", db_audio_path)
+
+        if not Path(db_audio_path).is_file():
+            logger.error(
+                "Local audio file does not exist: %s",
+                db_audio_path,
+            )
+            raise SystemExit(1)
+
+        if db_audio_path != source_path:
+            logger.warning(
+                "The local database path differs from the submitted "
+                "input path. Confirm that it exists inside the "
+                "consumer containers: %s",
+                db_audio_path,
+            )
 
     try:
-        audio_object_key = upload_audio(audio_path, batch_id)
-    except Exception:
-        logger.exception("Failed to upload audio to MinIO")
-        raise SystemExit(1)
-
-    try:
-        create_jobs(job_ids, audio_object_key)
+        create_jobs(
+            job_ids,
+            audio_path=db_audio_path,
+            audio_object_key=audio_object_key,
+        )
     except Exception:
         logger.exception("Failed to create database jobs")
-        print(
-            "The audio is uploaded, but database job creation failed. "
-            f"MinIO object: {MINIO_BUCKET}/{audio_object_key}"
-        )
+
+        if audio_object_key:
+            print(
+                "The audio is uploaded, but database job creation "
+                "failed. MinIO object: "
+                f"{MINIO_BUCKET}/{audio_object_key}"
+            )
+
         raise SystemExit(1)
 
     published = send_tasks(job_ids)
@@ -460,7 +568,14 @@ def main():
     print(f"Batch ID:       {batch_id}")
     print(f"Jobs requested: {len(job_ids)}")
     print(f"Tasks published:{len(published)}")
-    print(f"MinIO object:   {MINIO_BUCKET}/{audio_object_key}")
+    print(f"Storage:        {args.storage}")
+
+    if args.storage == "minio":
+        print(f"MinIO bucket:   {MINIO_BUCKET}")
+        print(f"MinIO object:   {audio_object_key}")
+    else:
+        print(f"Local path:     {db_audio_path}")
+
     print(f"Queue:          {VAD_QUEUE}")
 
     if len(published) != len(job_ids):
@@ -483,9 +598,17 @@ def main():
 
     print("\nWaiting for job completion...")
     summary, finished = wait_for_jobs(job_ids)
-    print_summary(job_ids, summary, published, finished)
 
-    # Stop after collecting and printing the pipeline results.
+    print_summary(
+        job_ids=job_ids,
+        summary=summary,
+        published=published,
+        finished=finished,
+        storage=args.storage,
+        audio_path=db_audio_path,
+        audio_object_key=audio_object_key,
+    )
+
     elapsed = time.monotonic() - run_started
 
     completed_jobs = sum(
@@ -497,13 +620,10 @@ def main():
     )
 
     print("\n=== TIMING SUMMARY ===")
-    print(f"Total elapsed time:   {format_elapsed(elapsed)}")
+    print(f"Total elapsed time:    {format_elapsed(elapsed)}")
     print(f"Total elapsed seconds: {elapsed:.2f}s")
-    print(f"Jobs completed:       {completed_jobs}/{len(job_ids)}")
-    print(
-        f"Audio hours completed: "
-        f"{completed_audio_hours:.2f}"
-    )
+    print(f"Jobs completed:        {completed_jobs}/{len(job_ids)}")
+    print(f"Audio hours completed: {completed_audio_hours:.2f}")
 
     if elapsed > 0 and completed_audio_hours > 0:
         throughput = completed_audio_hours / (elapsed / 3600)

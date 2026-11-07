@@ -21,4 +21,6 @@ scipy==1.17.1
 scikit-learn==1.9.0
 modelscope==1.33.0
 
+# 文档中心 / Web 演示页（仅 --web 挂载；非 vllm 传递依赖，独立声明）
 torchcodec==0.9.1
+
