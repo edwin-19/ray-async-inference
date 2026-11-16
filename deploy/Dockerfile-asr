@@ -1,6 +1,5 @@
 
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
-ARG VLLM_TAG=v0.14.0
 
 FROM ${BASE_IMAGE}
 
@@ -9,13 +8,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     PIP_NO_CACHE_DIR=1 \
     UV_CACHE_DIR=/root/.cache/uv \
-    HF_HOME=/root/.cache/huggingface \
-    VLLM_USE_PRECOMPILED=0
+    HF_HOME=/root/.cache/huggingface
 
-# Install uv without changing the NVIDIA Python/PyTorch environment.
+# Install uv without replacing NVIDIA's Python/PyTorch stack.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# System dependencies and native build tools.
+# System dependencies.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -27,53 +25,35 @@ RUN apt-get update && \
         libsndfile1 \
         ca-certificates \
         pkg-config \
-        python3-dev \
     && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /tmp/vllm-build
-
-# Build vLLM against NVIDIA's existing PyTorch.
-ARG VLLM_TAG
-
-RUN git clone --depth 1 --branch ${VLLM_TAG} \
-        https://github.com/vllm-project/vllm.git . && \
-    python3 tools/use_existing_torch.py && \
-    uv pip install --system --break-system-packages \
-        -r requirements/build.txt && \
-    uv pip install --system --break-system-packages \
-        --no-build-isolation .
 
 WORKDIR /app
 
 # Install ASR and pipeline dependencies.
 COPY requirements/requirements-asr.txt /requirements-asr.txt
 
-# Keep NVIDIA's preinstalled framework versions constrained.
 RUN uv pip install --system --break-system-packages \
-        --constraint /etc/pip/constraint.txt \
-        -r /requirements-asr.txt
+    -r /requirements-asr.txt
 
 # Copy Ray Serve consumer and supporting modules.
 COPY . /app
 
-# Verify the installed runtime.
+# Verify NVIDIA runtime and Ray dependencies.
 RUN python3 - <<'PY'
 import torch
-import vllm
 import ray
 
 print("=" * 60)
 print("PyTorch:", torch.__version__)
-print("PyTorch CUDA:", torch.version.cuda)
+print("CUDA:", torch.version.cuda)
 print("CUDA available:", torch.cuda.is_available())
-print("vLLM:", vllm.__version__)
 print("Ray:", ray.__version__)
 print("=" * 60)
 
 assert torch.version.cuda is not None, "CUDA-enabled PyTorch required"
 PY
 
-# Ray Serve consumer entrypoint.
+# Start Ray Serve consumer.
 ENTRYPOINT []
 
 CMD ["serve", "run", "task.asr:app"]
