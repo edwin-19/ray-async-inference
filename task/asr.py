@@ -1,7 +1,10 @@
 
+import asyncio
+import inspect
 import logging
 import os
 import tempfile
+import threading
 import time
 from collections import Counter
 from itertools import islice
@@ -11,8 +14,8 @@ from uuid import UUID
 
 import boto3
 import soundfile as sf
-from dotenv import load_dotenv
 from celery import Celery
+from dotenv import load_dotenv
 from ray import serve
 from ray.serve.config import AutoscalingConfig
 from ray.serve.schema import CeleryAdapterConfig, TaskProcessorConfig
@@ -34,7 +37,7 @@ ASR_FAILED_QUEUE = os.getenv("ASR_FAILED_QUEUE", "asr_failed_queue")
 
 ASR_MODEL_NAME = os.getenv(
     "ASR_MODEL_NAME",
-    "Qwen/Qwen3-ASR-1.7B",
+    "Qwen/Qwen3-ASR-1.7B-hf",
 )
 
 ASR_DEFAULT_LANGUAGE = (
@@ -50,6 +53,21 @@ ASR_NUM_GPUS = float(
 
 ASR_NUM_CPUS = int(
     os.getenv("ASR_NUM_CPUS_PER_REPLICA", "2")
+)
+
+ASR_GPU_MEMORY_UTILIZATION = float(
+    os.getenv("ASR_GPU_MEMORY_UTILIZATION", "0.7")
+)
+
+ATTENTION_BACKEND = os.getenv("ATTENTION_BACKEND", "FLASHINFER")
+SPECULATOR_MODEL = os.getenv("SPECULATOR_MODEL", "mattymchen/Qwen3-ASR-1.7B-speculator.dflash2")
+
+ASR_MAX_MODEL_LEN = int(
+    os.getenv("ASR_MAX_MODEL_LEN", "4096")
+)
+
+ASR_MAX_NEW_TOKENS = int(
+    os.getenv("ASR_MAX_NEW_TOKENS", "1028")
 )
 
 
@@ -190,45 +208,232 @@ def enum_value(value):
     autoscaling_config=AutoscalingConfig(
         min_replicas=int(os.getenv("ASR_MIN_REPLICAS", "1")),
         max_replicas=int(os.getenv("ASR_MAX_REPLICAS", "1")),
-        target_ongoing_requests=int(os.getenv("ASR_TARGET_ONGOING_REQUESTS", "1")),
+        target_ongoing_requests=int(
+            os.getenv("ASR_TARGET_ONGOING_REQUESTS", "1")
+        ),
     ),
 )
 @task_consumer(task_processor_config=processor_config)
 class ASRConsumer:
 
     def __init__(self):
-        from qwen_asr import Qwen3ASRModel
+        # -------------------------------------------------------------
+        # 1. Start dedicated asyncio event loop
+        # -------------------------------------------------------------
 
-        gpu_memory_utilization = float(
-            os.getenv("ASR_GPU_MEMORY_UTILIZATION", "0.85")
+        self._async_loop = asyncio.new_event_loop()
+        self._async_loop_ready = threading.Event()
+        self._async_thread = threading.Thread(
+            target=self._run_event_loop,
+            name="asr-async-loop",
+            daemon=True,
         )
+
+        self._async_thread.start()
+
+        if not self._async_loop_ready.wait(timeout=30):
+            raise RuntimeError(
+                "ASR asyncio event loop failed to start"
+            )
+
+        # -------------------------------------------------------------
+        # 2. Initialize AsyncLLM on its own event loop
+        # -------------------------------------------------------------
 
         logger.info(
-            "Loading ASR model=%s backend=vLLM batch_size=%d "
-            "gpu_memory_utilization=%.2f",
+            "Loading ASR model=%s backend=vLLM AsyncLLM "
+            "batch_size=%d gpu_memory_utilization=%.2f",
             ASR_MODEL_NAME,
             ASR_BATCH_SIZE,
-            gpu_memory_utilization,
+            ASR_GPU_MEMORY_UTILIZATION,
         )
 
-        self.model = Qwen3ASRModel.LLM(
-            model=ASR_MODEL_NAME,
-            max_inference_batch_size=ASR_BATCH_SIZE,
-            max_model_len=5096,
-            max_new_tokens=1028,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_num_seqs=ASR_BATCH_SIZE,
-        )
+        try:
+            self.model = self._run_async(
+                self._initialize_async_model()
+            )
+        except Exception:
+            self._stop_async_loop()
+            raise
+
+        # -------------------------------------------------------------
+        # 3. Initialize MinIO
+        # -------------------------------------------------------------
 
         self.minio = create_minio_client()
 
-        logger.info("vLLM ASR model loaded")
+        logger.info("Async vLLM ASR model loaded")
 
         logger.info(
             "MinIO configured: endpoint=%s bucket=%s",
             MINIO_ENDPOINT,
             MINIO_BUCKET,
         )
+
+    # -----------------------------------------------------------------
+    # Async event loop management
+    # -----------------------------------------------------------------
+
+    def _run_event_loop(self):
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop_ready.set()
+
+        try:
+            self._async_loop.run_forever()
+
+        finally:
+            # Cancel outstanding tasks before closing the loop.
+            pending = asyncio.all_tasks(self._async_loop)
+
+            for task in pending:
+                task.cancel()
+
+            if pending:
+                self._async_loop.run_until_complete(
+                    asyncio.gather(
+                        *pending,
+                        return_exceptions=True,
+                    )
+                )
+
+            self._async_loop.run_until_complete(
+                self._async_loop.shutdown_asyncgens()
+            )
+
+            self._async_loop.close()
+
+    async def _initialize_async_model(self):
+        from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
+
+        model = Qwen3ASRModel.LLMAsync(
+            model=ASR_MODEL_NAME,
+            max_inference_batch_size=ASR_BATCH_SIZE,
+            max_model_len=ASR_MAX_MODEL_LEN,
+            max_new_tokens=ASR_MAX_NEW_TOKENS,
+            gpu_memory_utilization=ASR_GPU_MEMORY_UTILIZATION,
+            max_num_seqs=ASR_BATCH_SIZE,
+            attention_backend=ATTENTION_BACKEND,
+            speculative_config = {
+                "method": "dflash",
+                "model": SPECULATOR_MODEL,
+                "attention_backend": ATTENTION_BACKEND,
+                "num_speculative_tokens": 7,
+            }
+        )
+
+        # Support either a synchronous factory or an async factory.
+        if inspect.isawaitable(model):
+            model = await model
+
+        return model
+
+    def _run_async(self, coroutine):
+        if not self._async_loop.is_running():
+            coroutine.close()
+            raise RuntimeError(
+                "ASR asyncio event loop is not running"
+            )
+
+        if threading.current_thread() is self._async_thread:
+            coroutine.close()
+            raise RuntimeError(
+                "_run_async cannot be called from the ASR event loop thread"
+            )
+
+        future = asyncio.run_coroutine_threadsafe(
+            coroutine,
+            self._async_loop,
+        )
+
+        return future.result()
+
+    def _stop_async_loop(self):
+        loop = getattr(self, "_async_loop", None)
+
+        if loop is None or loop.is_closed():
+            return
+
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+
+        thread = getattr(self, "_async_thread", None)
+
+        if (
+            thread is not None
+            and thread.is_alive()
+            and threading.current_thread() is not thread
+        ):
+            thread.join(timeout=15)
+
+    def __del__(self):
+        # Best-effort cleanup when the replica is destroyed.
+        try:
+            self._stop_async_loop()
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------
+    # Async inference
+    # -----------------------------------------------------------------
+
+    async def _transcribe_batch_async(
+        self,
+        audio_batch,
+        language=None,
+    ):
+        return await self.model.transcribe_async(
+            audio=audio_batch,
+            language=language,
+        )
+
+    def _transcribe_batch(
+        self,
+        audio_batch,
+        language=None,
+    ):
+        if not audio_batch:
+            return []
+
+        started = time.perf_counter()
+
+        effective_language = normalize_language(language)
+
+        if effective_language is None:
+            effective_language = ASR_DEFAULT_LANGUAGE
+
+        # The Ray task handler remains synchronous.
+        # Actual inference executes on the dedicated asyncio loop.
+        results = self._run_async(
+            self._transcribe_batch_async(
+                audio_batch=audio_batch,
+                language=effective_language,
+            )
+        )
+
+        if not isinstance(results, list):
+            raise RuntimeError(
+                f"Expected list of ASR results, got "
+                f"{type(results).__name__}"
+            )
+
+        if len(results) != len(audio_batch):
+            raise RuntimeError(
+                f"ASR result count mismatch: "
+                f"submitted={len(audio_batch)}, "
+                f"received={len(results)}"
+            )
+
+        logger.info(
+            "ASR inference batch_size=%d language=%s elapsed=%.2fs",
+            len(audio_batch),
+            effective_language or "auto",
+            time.perf_counter() - started,
+        )
+
+        return [
+            result_fields(result)
+            for result in results
+        ]
 
     # -----------------------------------------------------------------
     # Audio helpers
@@ -318,51 +523,6 @@ class ASRConsumer:
             audio_batch.append((audio, sample_rate))
 
         return audio_batch
-
-    def _transcribe_batch(
-        self,
-        audio_batch,
-        language=None,
-    ):
-        if not audio_batch:
-            return []
-
-        started = time.perf_counter()
-
-        effective_language = normalize_language(language)
-
-        if effective_language is None:
-            effective_language = ASR_DEFAULT_LANGUAGE
-
-        results = self.model.transcribe(
-            audio=audio_batch,
-            language=effective_language,
-        )
-
-        if not isinstance(results, list):
-            raise RuntimeError(
-                f"Expected list of ASR results, got "
-                f"{type(results).__name__}"
-            )
-
-        if len(results) != len(audio_batch):
-            raise RuntimeError(
-                f"ASR result count mismatch: "
-                f"submitted={len(audio_batch)}, "
-                f"received={len(results)}"
-            )
-
-        logger.info(
-            "ASR inference batch_size=%d language=%s elapsed=%.2fs",
-            len(audio_batch),
-            effective_language or "auto",
-            time.perf_counter() - started,
-        )
-
-        return [
-            result_fields(result)
-            for result in results
-        ]
 
     # -----------------------------------------------------------------
     # Main task

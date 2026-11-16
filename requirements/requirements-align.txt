@@ -1,5 +1,5 @@
 
-qwen-asr
+# qwen-asr
 ray[serve]==2.59.0
 celery[redis]
 redis
@@ -9,3 +9,7 @@ boto3
 python-dotenv
 soundfile
 numpy
+transformers
+nagisa
+
+librosa

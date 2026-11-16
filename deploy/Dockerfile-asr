@@ -1,44 +1,58 @@
 
-ARG VLLM_TAG=v0.14.0
-FROM vllm/vllm-openai:${VLLM_TAG}
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
 
-# Install uv without replacing the base image's Python/PyTorch stack
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+FROM ${BASE_IMAGE}
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
-    PIP_NO_CACHE_DIR=1 \
-    HF_HOME=/root/.cache/huggingface
+# ENV PYTHONUNBUFFERED=1 \
+#     PYTHONDONTWRITEBYTECODE=1 \
+#     PYTHONPATH=/app \
+#     PIP_NO_CACHE_DIR=1 \
+#     HF_HOME=/root/.cache/huggingface
 
-# Audio runtime libraries and build dependencies
+# System dependencies.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
-        ffmpeg \
-        git \
+        cmake \
         curl \
+        ffmpeg \
         libsndfile1 \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates
 
 WORKDIR /app
 
-# Install ASR and pipeline dependencies
+# Install application dependencies.
 COPY requirements/requirements-asr.txt /requirements-asr.txt
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --break-system-packages \
-        -r /requirements-asr.txt
+RUN python3 -m pip install \
+    --constraint /etc/pip/constraint.txt \
+    -r /requirements-asr.txt
 
-# Copy Ray Serve consumer and supporting modules
+# Verify installed environment.
+RUN python3 - <<'PY'
+import torch
+import ray
+import transformers
+import vllm
+
+from transformers import AutoProcessor, AutoModelForMultimodalLM
+
+print("=" * 60)
+print("PyTorch:", torch.__version__)
+print("CUDA:", torch.version.cuda)
+print("Ray:", ray.__version__)
+print("Transformers:", transformers.__version__)
+print("vLLM:", vllm.__version__)
+print("AutoProcessor: OK")
+print("AutoModelForMultimodalLM: OK")
+print("=" * 60)
+
+assert torch.version.cuda is not None, "CUDA-enabled PyTorch required"
+PY
+
+# Copy application.
 COPY . /app
 
-# Verify core runtime imports and CUDA visibility
-RUN python3 -c "import torch; import vllm; print('PyTorch:', torch.__version__); print('vLLM:', vllm.__version__); print('CUDA available:', torch.cuda.is_available())"
-
-# Override the base vLLM API-server entrypoint.
-# Start this container as a Ray Serve consumer instead.
 ENTRYPOINT []
 
 CMD ["serve", "run", "task.asr:app"]

@@ -1,7 +1,6 @@
 
 # FireRedVAD
 fireredvad[gpu]
-huggingface_hub
 
 # Task queue
 celery[redis]

@@ -49,6 +49,7 @@ VAD_FAILED_QUEUE = os.getenv(
     "VAD_FAILED_QUEUE",
     "vad_failed_queue",
 )
+VAD_USE_GPU = os.getenv("VAD_USE_GPU", "false").lower() in ("1", "true", "yes", "on")
 
 processor_config = TaskProcessorConfig(
     queue_name=VAD_QUEUE_NAME,
@@ -143,7 +144,7 @@ class VadConsumer:
             )
 
         config = FireRedVadConfig(
-            use_gpu=True,
+            use_gpu=VAD_USE_GPU,
             smooth_window_size=5,
             speech_threshold=0.5,
             min_speech_frame=10,
