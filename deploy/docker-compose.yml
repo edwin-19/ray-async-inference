@@ -73,59 +73,7 @@ services:
       HF_HOME: /root/.cache/huggingface
 
     command: ["serve", "run", "task.asr:app"]
-    
-  vad-failed-consumer:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile-asr
-    image: speech-asr:latest
-    container_name: vad-failed-consumer
-    restart: unless-stopped
-
-    network_mode: host
-    working_dir: /app
-
-    env_file:
-      - ../.env
-
-    environment:
-      PYTHONPATH: /app
-      PYTHONUNBUFFERED: "1"
-      REDIS_HOST: 127.0.0.1
-      REDIS_PORT: "6379"
-      VAD_FAILED_QUEUE: vad_failed_queue
-      VAD_FAILED_MAX_RETRIES: "3"
-      VAD_FAILED_NUM_CPUS: "0.2"
-
-    command: ["serve", "run", "task.vad_failed_consumer:app"]
-
-  asr-failed-consumer:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile-asr
-    image: speech-asr:latest
-    container_name: asr-failed-consumer
-    restart: unless-stopped
-
-    network_mode: host
-    working_dir: /app
-
-    env_file:
-      - ../.env
-
-    environment:
-      PYTHONPATH: /app
-      PYTHONUNBUFFERED: "1"
-
-      REDIS_HOST: 127.0.0.1
-      REDIS_PORT: "6379"
-
-      ASR_FAILED_QUEUE: asr_failed_queue
-      ASR_FAILED_MAX_RETRIES: "3"
-
-    command: ["serve", "run", "task.asr_failed_consumer:app"]
-
-
+  
   align-consumer:
     build:
       context: ..
@@ -150,14 +98,11 @@ services:
       - ../.env
 
     environment:
-      PYTHONPATH: /app
-      PYTHONUNBUFFERED: "1"
-
       REDIS_HOST: 127.0.0.1
       REDIS_PORT: "6379"
       MINIO_ENDPOINT: 127.0.0.1:9000
 
-      ALIGN_MODEL_NAME: Qwen/Qwen3-ForcedAligner-0.6B
+      ALIGN_MODEL_NAME: Qwen/Qwen3-ForcedAligner-0.6B-hf
       ALIGN_BATCH_SIZE: "16"
       ALIGN_NUM_GPUS_PER_REPLICA: "1"
       ALIGN_NUM_CPUS_PER_REPLICA: "1"
@@ -165,6 +110,55 @@ services:
       ALIGN_MAX_REPLICAS: "4"
       ALIGN_TARGET_ONGOING_REQUESTS: "4"
 
-      HF_HOME: /root/.cache/huggingface
-
     command: ["serve", "run", "task.align_consumer:app"]
+
+  vad-failed-consumer:
+    # build:
+    #   context: ..
+    #   dockerfile: deploy/Dockerfile-asr
+    image: speech-asr:latest
+    container_name: vad-failed-consumer
+    restart: unless-stopped
+
+    network_mode: host
+    working_dir: /app
+
+    env_file:
+      - ../.env
+
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      VAD_FAILED_QUEUE: vad_failed_queue
+      VAD_FAILED_MAX_RETRIES: "3"
+      VAD_FAILED_NUM_CPUS: "0.2"
+
+    command: ["serve", "run", "task.vad_failed_consumer:app"]
+
+  asr-failed-consumer:
+    # build:
+    #   context: ..
+    #   dockerfile: deploy/Dockerfile-asr
+    image: speech-asr:latest
+    container_name: asr-failed-consumer
+    restart: unless-stopped
+
+    network_mode: host
+    working_dir: /app
+
+    env_file:
+      - ../.env
+
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+
+      ASR_FAILED_QUEUE: asr_failed_queue
+      ASR_FAILED_MAX_RETRIES: "3"
+
+    command: ["serve", "run", "task.asr_failed_consumer:app"]

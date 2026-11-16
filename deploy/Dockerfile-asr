@@ -3,57 +3,56 @@ ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
 
 FROM ${BASE_IMAGE}
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
-    PIP_NO_CACHE_DIR=1 \
-    UV_CACHE_DIR=/root/.cache/uv \
-    HF_HOME=/root/.cache/huggingface
-
-# Install uv without replacing NVIDIA's Python/PyTorch stack.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# ENV PYTHONUNBUFFERED=1 \
+#     PYTHONDONTWRITEBYTECODE=1 \
+#     PYTHONPATH=/app \
+#     PIP_NO_CACHE_DIR=1 \
+#     HF_HOME=/root/.cache/huggingface
 
 # System dependencies.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
-        ninja-build \
-        git \
         curl \
         ffmpeg \
         libsndfile1 \
-        ca-certificates \
-        pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates
 
 WORKDIR /app
 
-# Install ASR and pipeline dependencies.
+# Install application dependencies.
 COPY requirements/requirements-asr.txt /requirements-asr.txt
 
-RUN uv pip install --system --break-system-packages \
+RUN python3 -m pip install \
+    --constraint /etc/pip/constraint.txt \
     -r /requirements-asr.txt
 
-# Copy Ray Serve consumer and supporting modules.
-COPY . /app
-
-# Verify NVIDIA runtime and Ray dependencies.
+# Verify installed environment.
 RUN python3 - <<'PY'
 import torch
 import ray
+import transformers
+import vllm
+
+from transformers import AutoProcessor, AutoModelForMultimodalLM
 
 print("=" * 60)
 print("PyTorch:", torch.__version__)
 print("CUDA:", torch.version.cuda)
-print("CUDA available:", torch.cuda.is_available())
 print("Ray:", ray.__version__)
+print("Transformers:", transformers.__version__)
+print("vLLM:", vllm.__version__)
+print("AutoProcessor: OK")
+print("AutoModelForMultimodalLM: OK")
 print("=" * 60)
 
 assert torch.version.cuda is not None, "CUDA-enabled PyTorch required"
 PY
 
-# Start Ray Serve consumer.
+# Copy application.
+COPY . /app
+
 ENTRYPOINT []
 
 CMD ["serve", "run", "task.asr:app"]

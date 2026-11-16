@@ -56,8 +56,11 @@ ASR_NUM_CPUS = int(
 )
 
 ASR_GPU_MEMORY_UTILIZATION = float(
-    os.getenv("ASR_GPU_MEMORY_UTILIZATION", "0.6")
+    os.getenv("ASR_GPU_MEMORY_UTILIZATION", "0.7")
 )
+
+ATTENTION_BACKEND = os.getenv("ATTENTION_BACKEND", "FLASHINFER")
+SPECULATOR_MODEL = os.getenv("SPECULATOR_MODEL", "mattymchen/Qwen3-ASR-1.7B-speculator.dflash2")
 
 ASR_MAX_MODEL_LEN = int(
     os.getenv("ASR_MAX_MODEL_LEN", "4096")
@@ -309,6 +312,13 @@ class ASRConsumer:
             max_new_tokens=ASR_MAX_NEW_TOKENS,
             gpu_memory_utilization=ASR_GPU_MEMORY_UTILIZATION,
             max_num_seqs=ASR_BATCH_SIZE,
+            attention_backend=ATTENTION_BACKEND,
+            speculative_config = {
+                "method": "dflash",
+                "model": SPECULATOR_MODEL,
+                "attention_backend": ATTENTION_BACKEND,
+                "num_speculative_tokens": 7,
+            }
         )
 
         # Support either a synchronous factory or an async factory.

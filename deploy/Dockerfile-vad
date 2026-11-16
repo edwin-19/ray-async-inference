@@ -1,20 +1,11 @@
 
 FROM nvcr.io/nvidia/pytorch:26.10-py3
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONPATH=/app \
-    VAD_MODEL_PATH=/app/pretrained_models/FireRedVAD/VAD
+ENV VAD_MODEL_PATH=/app/pretrained_models/FireRedVAD/VAD
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-dev \
     build-essential \
     git \
     ffmpeg \

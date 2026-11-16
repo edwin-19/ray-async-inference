@@ -1,1222 +1,365 @@
-import logging
-import math
-import os
-import tempfile
-import time
-from itertools import islice
-from pathlib import Path
-from urllib.parse import quote
-from uuid import UUID
+# coding=utf-8
+# Copyright 2026 The Alibaba Qwen team.
+# SPDX-License-Identifier: Apache-2.0
+from bisect import bisect_right
+from dataclasses import dataclass
+from typing import Any, List, Optional, Union
 
-import boto3
-import numpy as np
-import soundfile as sf
 import torch
-from dotenv import load_dotenv
-from scipy.signal import resample_poly
-from transformers import (
-    AutoModelForTokenClassification,
-    AutoProcessor,
-)
+from transformers.models.qwen3_asr.configuration_qwen3_asr import Qwen3ASRConfig
+from transformers.models.qwen3_asr.modeling_qwen3_asr import Qwen3ASRForTokenClassification
+from transformers.models.qwen3_asr.processing_qwen3_asr import Qwen3ASRProcessor
 
-from ray import serve
-from ray.serve.config import AutoscalingConfig
-from ray.serve.schema import CeleryAdapterConfig, TaskProcessorConfig
-from ray.serve.task_consumer import task_consumer, task_handler
+from .compile_utils import compile_model_forward
+from .utils import AudioLike, ensure_list, normalize_audios
 
 
-load_dotenv()
+def _repair_timestamps(values: Any) -> List[int]:
+    """Repair timestamp bins while preserving the legacy stable anchors."""
+    data = values.tolist() if hasattr(values, "tolist") else list(values)
+    count = len(data)
+    if count == 0:
+        # Preserve the exception raised by the previous max(dp) implementation.
+        raise ValueError("max() arg is an empty sequence")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("align.consumer")
+    # Stable O(n log n) LNDS construction from Qwen3-ASR PR #215, based on
+    # vLLM-Omni PR #8230. The level lists retain the legacy implementation's
+    # first endpoint and first valid predecessor tie-breaking behavior.
+    tails: List[Any] = []
+    levels: List[List[int]] = []
+    for index, value in enumerate(data):
+        length = bisect_right(tails, value)
+        if length == len(tails):
+            tails.append(value)
+            levels.append([])
+        else:
+            tails[length] = value
+        levels[length].append(index)
 
+    is_normal = [False] * count
+    index = levels[-1][0]
+    is_normal[index] = True
+    for depth in range(len(levels) - 2, -1, -1):
+        for predecessor in levels[depth]:
+            if data[predecessor] <= data[index]:
+                index = predecessor
+                is_normal[index] = True
+                break
 
-# ------------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------------
+    result = data.copy()
+    block_start = 0
+    while block_start < count:
+        if is_normal[block_start]:
+            block_start += 1
+            continue
 
-ALIGN_QUEUE = os.getenv("ALIGN_QUEUE", "align_queue")
+        block_end = block_start
+        while block_end < count and not is_normal[block_end]:
+            block_end += 1
+        anomaly_count = block_end - block_start
 
-ALIGN_MODEL_NAME = os.getenv(
-    "ALIGN_MODEL_NAME",
-    "Qwen/Qwen3-ForcedAligner-0.6B-hf",
-)
-
-ALIGN_BATCH_SIZE = max(
-    1,
-    int(os.getenv("ALIGN_BATCH_SIZE", "4")),
-)
-
-ALIGN_DEVICE = os.getenv("ALIGN_DEVICE", "auto")
-
-ALIGN_NUM_GPUS = float(
-    os.getenv("ALIGN_NUM_GPUS_PER_REPLICA", "1")
-)
-
-ALIGN_NUM_CPUS = int(
-    os.getenv("ALIGN_NUM_CPUS_PER_REPLICA", "2")
-)
-
-# torch.compile recompiles for every new input shape. Segments have
-# variable lengths, so keep this off unless you bucket/pad lengths.
-ALIGN_COMPILE = os.getenv(
-    "ALIGN_COMPILE",
-    "false",
-).lower() in {"1", "true", "yes"}
-
-ALIGN_COMPILE_MODE = os.getenv(
-    "ALIGN_COMPILE_MODE",
-    "default",
-)
-
-# What to do with segments whose language the HF processor rejects
-# (for example Malay):
-#   fallback - align using ALIGN_FALLBACK_LANGUAGE. In the original
-#              qwen_asr implementation the language only selects the
-#              word tokenizer (Japanese and Korean have special ones,
-#              every other language is split on whitespace), and the
-#              model never receives the language. So "English" gives
-#              the same tokenization the original uses for Malay.
-#              Only suitable for space-delimited languages.
-#   skip     - mark the segment "skipped" and leave it unaligned
-ALIGN_UNSUPPORTED_POLICY = os.getenv(
-    "ALIGN_UNSUPPORTED_POLICY",
-    "fallback",
-).lower()
-
-ALIGN_FALLBACK_LANGUAGE = os.getenv(
-    "ALIGN_FALLBACK_LANGUAGE",
-    "English",
-)
-
-SUPPORTED_LANGUAGES = {
-    "zh": "Chinese",
-    "en": "English",
-    "yue": "Cantonese",
-    "fr": "French",
-    "de": "German",
-    "it": "Italian",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "pt": "Portuguese",
-    "ru": "Russian",
-    "es": "Spanish",
-}
-
-MINIO_ENDPOINT = os.getenv(
-    "MINIO_ENDPOINT",
-    "127.0.0.1:9000",
-)
-
-MINIO_BUCKET = os.getenv(
-    "MINIO_BUCKET",
-    "speech-data",
-)
-
-MINIO_ACCESS_KEY = os.getenv(
-    "MINIO_ACCESS_KEY",
-    os.getenv("MINIO_ROOT_USER", ""),
-)
-
-MINIO_SECRET_KEY = os.getenv(
-    "MINIO_SECRET_KEY",
-    os.getenv("MINIO_ROOT_PASSWORD", ""),
-)
-
-MINIO_SECURE = os.getenv(
-    "MINIO_SECURE",
-    "false",
-).lower() in {"1", "true", "yes"}
-
-
-# ------------------------------------------------------------------
-# Redis
-# ------------------------------------------------------------------
-
-def redis_url(db: int) -> str:
-    host = os.getenv("REDIS_HOST", "127.0.0.1")
-    port = int(os.getenv("REDIS_PORT", "6379"))
-    password = os.getenv("REDIS_PASSWORD", "")
-
-    if password:
-        return (
-            f"redis://:{quote(password, safe='')}"
-            f"@{host}:{port}/{db}"
+        left_value = next(
+            (result[pos] for pos in range(block_start - 1, -1, -1) if is_normal[pos]),
+            None,
+        )
+        right_value = next(
+            (result[pos] for pos in range(block_end, count) if is_normal[pos]),
+            None,
         )
 
-    return f"redis://{host}:{port}/{db}"
+        if anomaly_count <= 2:
+            for pos in range(block_start, block_end):
+                if left_value is None:
+                    result[pos] = right_value
+                elif right_value is None:
+                    result[pos] = left_value
+                else:
+                    distance_left = pos - (block_start - 1)
+                    distance_right = block_end - pos
+                    result[pos] = left_value if distance_left <= distance_right else right_value
+        elif left_value is not None and right_value is not None:
+            step = (right_value - left_value) / (anomaly_count + 1)
+            for pos in range(block_start, block_end):
+                result[pos] = left_value + step * (pos - block_start + 1)
+        elif left_value is not None:
+            for pos in range(block_start, block_end):
+                result[pos] = left_value
+        elif right_value is not None:
+            for pos in range(block_start, block_end):
+                result[pos] = right_value
+
+        block_start = block_end
+
+    return [int(value) for value in result]
 
 
-# ------------------------------------------------------------------
-# MinIO
-# ------------------------------------------------------------------
+def _decode_timestamp_bins(timestamp_logits: torch.Tensor) -> List[int]:
+    """Decode monotonic timestamp bins, resolving zero-duration words by score."""
+    if timestamp_logits.ndim != 2:
+        raise ValueError("timestamp_logits must have shape [timestamp_tokens, timestamp_bins]")
 
-def create_minio_client():
-    if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
-        raise RuntimeError("MinIO credentials are missing")
+    timestamp_count, bin_count = timestamp_logits.shape
+    if timestamp_count % 2:
+        raise ValueError("timestamp_logits must contain paired start and end tokens")
 
-    return boto3.client(
-        "s3",
-        endpoint_url=(
-            f"http{'s' if MINIO_SECURE else ''}://{MINIO_ENDPOINT}"
-        ),
-        aws_access_key_id=MINIO_ACCESS_KEY,
-        aws_secret_access_key=MINIO_SECRET_KEY,
+    raw_bins = timestamp_logits.argmax(dim=-1).detach().cpu().tolist()
+    repaired_bins = _repair_timestamps(raw_bins)
+    if all(
+        repaired_bins[position] < repaired_bins[position + 1]
+        for position in range(0, timestamp_count, 2)
+    ):
+        return repaired_bins
+
+    # The checkpoint predicts each boundary independently, so a short word can
+    # receive the same highest-scoring 80 ms bin for both start and end. Only in
+    # that case, find the maximum-score path whose boundaries remain monotonic
+    # and whose word ends are at least one bin after their starts. This uses the
+    # model's alternative scores rather than inventing a fixed offset.
+    if bin_count < 2:
+        return repaired_bins
+
+    scores = timestamp_logits.float()
+    previous_scores = scores[0]
+    backpointers: List[torch.Tensor] = []
+    negative_infinity = torch.full(
+        (1,),
+        float("-inf"),
+        dtype=scores.dtype,
+        device=scores.device,
     )
 
-
-# ------------------------------------------------------------------
-# Ray Serve task processor
-# ------------------------------------------------------------------
-
-processor_config = TaskProcessorConfig(
-    queue_name=ALIGN_QUEUE,
-    adapter_config=CeleryAdapterConfig(
-        broker_url=redis_url(0),
-        backend_url=redis_url(1),
-    ),
-)
-
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-def aligner_language(language):
-    """
-    Map a segment language (code or name) to a language the aligner
-    supports. Returns None if it is unsupported and the policy is
-    "skip".
-    """
-
-    value = str(language or "").strip().lower()
-
-    for code, name in SUPPORTED_LANGUAGES.items():
-        if value in (code, name.lower()):
-            return name
-
-    if ALIGN_UNSUPPORTED_POLICY == "fallback":
-        return ALIGN_FALLBACK_LANGUAGE
-
-    return None
-
-
-def batched(items, size):
-    iterator = iter(items)
-
-    while True:
-        batch = list(islice(iterator, size))
-
-        if not batch:
-            break
-
-        yield batch
-
-
-# ------------------------------------------------------------------
-# Alignment consumer
-# ------------------------------------------------------------------
-
-@serve.deployment(
-    name="align-consumer",
-    max_ongoing_requests=1,
-    ray_actor_options={
-        "num_cpus": ALIGN_NUM_CPUS,
-        "num_gpus": ALIGN_NUM_GPUS,
-    },
-    autoscaling_config=AutoscalingConfig(
-        min_replicas=int(
-            os.getenv("ALIGN_MIN_REPLICAS", "1")
-        ),
-        max_replicas=int(
-            os.getenv("ALIGN_MAX_REPLICAS", "1")
-        ),
-        target_ongoing_requests=int(
-            os.getenv("ALIGN_TARGET_ONGOING_REQUESTS", "1")
-        ),
-    ),
-)
-@task_consumer(task_processor_config=processor_config)
-class AlignConsumer:
-
-    # --------------------------------------------------------------
-    # Initialization
-    # --------------------------------------------------------------
-
-    def __init__(self):
-        try:
-            self._load_model()
-        except Exception:
-            # Log the real startup error. Otherwise Ray's __del__
-            # noise ("no attribute '_adapter'") hides it.
-            logger.exception("AlignConsumer failed to initialize")
-            raise
-
-    def _load_model(self):
-        if ALIGN_DEVICE == "auto":
-            device = (
-                "cuda:0"
-                if torch.cuda.is_available()
-                else "cpu"
+    for position in range(1, timestamp_count):
+        prefix_scores, prefix_indices = torch.cummax(previous_scores, dim=0)
+        if position % 2:
+            # End tokens must follow their paired start by at least one bin.
+            best_scores = torch.cat((negative_infinity, prefix_scores[:-1]))
+            best_indices = torch.cat(
+                (
+                    torch.zeros(1, dtype=prefix_indices.dtype, device=scores.device),
+                    prefix_indices[:-1],
+                )
             )
         else:
-            device = ALIGN_DEVICE
+            # A word may start where the preceding word ends.
+            best_scores = prefix_scores
+            best_indices = prefix_indices
+        previous_scores = scores[position] + best_scores
+        backpointers.append(best_indices)
 
-        if device.startswith("cuda"):
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    f"{device} requested but CUDA is unavailable"
-                )
+    if not torch.isfinite(previous_scores).any():
+        return repaired_bins
 
-            dtype = (
-                torch.bfloat16
-                if torch.cuda.is_bf16_supported()
-                else torch.float16
-            )
-        else:
-            dtype = torch.float32
+    cursor = int(previous_scores.argmax().item())
+    constrained_bins = [cursor]
+    for pointers in reversed(backpointers):
+        cursor = int(pointers[cursor].item())
+        constrained_bins.append(cursor)
+    constrained_bins.reverse()
 
-        self.device = device
-        self.dtype = dtype
+    if any(
+        constrained_bins[position] >= constrained_bins[position + 1]
+        for position in range(0, timestamp_count, 2)
+    ):
+        return repaired_bins
+    return constrained_bins
 
-        logger.info(
-            "Loading aligner model=%s device=%s dtype=%s",
-            ALIGN_MODEL_NAME,
-            device,
-            dtype,
-        )
 
-        # Processor (handles feature extraction and padding).
-        self.processor = AutoProcessor.from_pretrained(
-            ALIGN_MODEL_NAME,
-        )
+@dataclass(frozen=True)
+class ForcedAlignItem:
+    text: str
+    start_time: float
+    end_time: float
 
-        self.sample_rate = int(
-            getattr(
-                self.processor.feature_extractor,
-                "sampling_rate",
-                16000,
-            )
-        )
 
-        # Model.
-        self.model = AutoModelForTokenClassification.from_pretrained(
-            ALIGN_MODEL_NAME,
-            dtype=dtype,
-        ).to(device)
+@dataclass(frozen=True)
+class ForcedAlignResult:
+    items: List[ForcedAlignItem]
 
-        self.model.eval()
+    def __iter__(self):
+        return iter(self.items)
 
-        if ALIGN_COMPILE and device.startswith("cuda"):
-            logger.info(
-                "Compiling aligner forward pass mode=%s",
-                ALIGN_COMPILE_MODE,
-            )
+    def __len__(self):
+        return len(self.items)
 
-            self.model.forward = torch.compile(
-                self.model.forward,
-                mode=ALIGN_COMPILE_MODE,
-            )
+    def __getitem__(self, idx: int) -> ForcedAlignItem:
+        return self.items[idx]
 
-        self.minio = None
 
-        logger.info(
-            "Aligner loaded device=%s dtype=%s "
-            "sample_rate=%d batch_size=%d compile=%s",
-            self.device,
-            self.dtype,
-            self.sample_rate,
-            ALIGN_BATCH_SIZE,
-            ALIGN_COMPILE,
-        )
+class Qwen3ForcedAligner:
+    """Native Transformers wrapper for Qwen3-ForcedAligner checkpoints."""
 
-    # --------------------------------------------------------------
-    # MinIO client
-    # --------------------------------------------------------------
-
-    def _get_minio_client(self):
-        if self.minio is None:
-            self.minio = create_minio_client()
-
-        return self.minio
-
-    # --------------------------------------------------------------
-    # Audio download
-    # --------------------------------------------------------------
-
-    def _download_audio(self, object_key: str) -> str:
-        suffix = Path(object_key).suffix or ".audio"
-
-        with tempfile.NamedTemporaryFile(
-            prefix="align_",
-            suffix=suffix,
-            delete=False,
-        ) as temp_file:
-            temp_path = temp_file.name
-
-        try:
-            self._get_minio_client().download_file(
-                MINIO_BUCKET,
-                object_key,
-                temp_path,
-            )
-
-            return temp_path
-
-        except Exception:
+    def __init__(self, model: Any, processor: Any, torch_compile_enabled: bool = False):
+        self.model = model
+        self.processor = processor
+        self.torch_compile_enabled = bool(torch_compile_enabled)
+        self.device = getattr(model, "device", None)
+        if self.device is None:
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+                self.device = next(model.parameters()).device
+            except StopIteration:
+                self.device = torch.device("cpu")
+        self.timestamp_token_id = int(model.config.timestamp_token_id)
 
-            raise
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        torch_compile: bool = False,
+        torch_compile_backend: str = "inductor",
+        torch_compile_mode: str = "default",
+        torch_compile_fullgraph: bool = False,
+        torch_compile_dynamic: bool | None = None,
+        **kwargs: Any,
+    ) -> "Qwen3ForcedAligner":
+        # vLLM registers its generation-oriented Qwen3ASRConfig under the same
+        # AutoConfig model type as Transformers. Once a vLLM ASR engine has
+        # started, the Auto* classes can therefore resolve an aligner checkpoint
+        # to vLLM's config, which has thinker_config instead of audio_config.
+        # Pin the native Transformers classes explicitly so lazy aligner loading
+        # remains independent of vLLM's process-wide registry changes.
+        config = kwargs.pop("config", None)
+        hub_keys = {
+            "cache_dir",
+            "force_download",
+            "local_files_only",
+            "proxies",
+            "revision",
+            "subfolder",
+            "token",
+            "trust_remote_code",
+        }
+        hub_kwargs = {key: value for key, value in kwargs.items() if key in hub_keys}
+        if config is None:
+            config = Qwen3ASRConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                **hub_kwargs,
+            )
 
-    # --------------------------------------------------------------
-    # Read and prepare audio batch
-    # --------------------------------------------------------------
+        model = Qwen3ASRForTokenClassification.from_pretrained(
+            pretrained_model_name_or_path,
+            config=config,
+            **kwargs,
+        )
+        model.eval()
+        compile_enabled = compile_model_forward(
+            model,
+            enabled=torch_compile,
+            backend=torch_compile_backend,
+            mode=torch_compile_mode,
+            fullgraph=torch_compile_fullgraph,
+            dynamic=torch_compile_dynamic,
+            label="forced aligner",
+        )
+        processor = Qwen3ASRProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            fix_mistral_regex=True,
+            **hub_kwargs,
+        )
+        return cls(
+            model=model,
+            processor=processor,
+            torch_compile_enabled=compile_enabled,
+        )
 
-    def _read_audio_batch(
+    def warm_up(
         self,
-        source,
-        segments,
-        sample_rate,
-    ):
-        if sample_rate <= 0:
-            raise ValueError(
-                f"Invalid audio sample rate: {sample_rate}"
-            )
-
-        audios = []
-        total_frames = len(source)
-
-        for segment in segments:
-            segment_start = float(segment.start_seconds)
-            segment_end = float(segment.end_seconds)
-
-            if not (
-                math.isfinite(segment_start)
-                and math.isfinite(segment_end)
-            ):
-                raise ValueError(
-                    f"Invalid segment timestamps: "
-                    f"{segment_start}, {segment_end}"
-                )
-
-            if segment_start < 0 or segment_end <= segment_start:
-                raise ValueError(
-                    f"Invalid segment boundaries: "
-                    f"{segment_start}, {segment_end}"
-                )
-
-            start_frame = max(
-                0,
-                int(segment_start * sample_rate),
-            )
-
-            end_frame = min(
-                total_frames,
-                int(segment_end * sample_rate),
-            )
-
-            if end_frame <= start_frame:
-                raise ValueError(
-                    f"Segment {segment.segment_index} "
-                    "has no audio frames"
-                )
-
-            source.seek(start_frame)
-
-            audio = source.read(
-                frames=end_frame - start_frame,
-                dtype="float32",
-                always_2d=False,
-            )
-
-            if audio.size == 0:
-                raise ValueError(
-                    f"Segment {segment.segment_index} "
-                    "contains empty audio"
-                )
-
-            # Convert multichannel audio to mono.
-            if audio.ndim == 2:
-                audio = audio.mean(axis=1)
-
-            # Reject NaN and infinite samples.
-            if not np.isfinite(audio).all():
-                raise ValueError(
-                    f"Segment {segment.segment_index} "
-                    "contains non-finite audio samples"
-                )
-
-            # Resample to the model's expected sample rate.
-            if sample_rate != self.sample_rate:
-                divisor = math.gcd(
-                    sample_rate,
-                    self.sample_rate,
-                )
-
-                audio = resample_poly(
-                    audio,
-                    self.sample_rate // divisor,
-                    sample_rate // divisor,
-                )
-
-            audio = np.ascontiguousarray(
-                audio,
-                dtype=np.float32,
-            )
-
-            if audio.size == 0:
-                raise ValueError(
-                    f"Segment {segment.segment_index} "
-                    "became empty after resampling"
-                )
-
-            audios.append(audio)
-
-        return audios
-
-    # --------------------------------------------------------------
-    # Native Transformers forced alignment
-    # --------------------------------------------------------------
-
-    def _align_batch(self, audios, segments):
-        if not audios or not segments:
-            return []
-
-        if len(audios) != len(segments):
-            raise ValueError(
-                "Audio and transcript batch sizes do not match"
-            )
-
-        transcripts = [
-            segment.text
-            for segment in segments
-        ]
-
-        languages = [
-            aligner_language(segment.language)
-            for segment in segments
-        ]
-
-        if any(language is None for language in languages):
-            raise ValueError(
-                "Unsupported alignment language in batch: "
-                f"{[segment.language for segment in segments]}"
-            )
-
-        # Prepare model inputs.
-        aligner_inputs, word_lists = (
-            self.processor.prepare_forced_aligner_inputs(
-                audio=audios,
-                transcript=transcripts,
-                language=languages,
-            )
-        )
-
-        # BatchFeature.to casts only floating-point tensors to the
-        # model dtype; integer tensors such as input_ids are kept.
-        aligner_inputs = aligner_inputs.to(
-            self.device,
-            self.dtype,
-        )
-
-        # Model inference.
-        with torch.inference_mode():
-            outputs = self.model(**aligner_inputs)
-
-        # Decode word-level timestamps.
-        results = self.processor.decode_forced_alignment(
-            logits=outputs.logits,
-            input_ids=aligner_inputs["input_ids"],
-            word_lists=word_lists,
-            timestamp_token_id=(
-                self.model.config.timestamp_token_id
-            ),
-        )
-
-        if len(results) != len(segments):
-            raise RuntimeError(
-                f"Aligner returned {len(results)} results "
-                f"for {len(segments)} segments"
-            )
-
-        return results
-
-    # --------------------------------------------------------------
-    # Convert alignment output into database rows
-    # --------------------------------------------------------------
+        *,
+        audio: AudioLike,
+        text: str,
+        language: str,
+    ) -> None:
+        self.align(audio=audio, text=text, language=language)
 
     @staticmethod
-    def _word_rows(segment, result):
-        items = list(result)
-
-        if not items:
-            raise ValueError(
-                "Aligner returned no word timestamps"
-            )
-
-        rows = []
-
-        segment_start = float(segment.start_seconds)
-        segment_end = float(segment.end_seconds)
-
-        for word_index, item in enumerate(items):
-            word_text = str(
-                item["text"]
-            ).strip()
-
-            if not word_text:
-                raise ValueError(
-                    f"Empty aligned word at index {word_index}"
-                )
-
-            relative_start = float(
-                item["start_time"]
-            )
-
-            relative_end = float(
-                item["end_time"]
-            )
-
-            if not (
-                math.isfinite(relative_start)
-                and math.isfinite(relative_end)
-            ):
-                raise ValueError(
-                    f"Non-finite timestamp at word {word_index}"
-                )
-
-            if (
-                relative_start < 0
-                or relative_end < relative_start
-            ):
-                raise ValueError(
-                    f"Invalid timestamps at word {word_index}: "
-                    f"{relative_start}, {relative_end}"
-                )
-
-            # Convert segment-relative timestamps to absolute
-            # timestamps and constrain them to segment boundaries.
-            start = min(
-                segment_end,
-                max(
-                    segment_start,
-                    segment_start + relative_start,
-                ),
-            )
-
-            end = min(
-                segment_end,
-                max(
-                    start,
-                    segment_start + relative_end,
-                ),
-            )
-
-            rows.append({
-                "word_index": word_index,
-                "text": word_text,
-                "start_seconds": start,
-                "end_seconds": end,
-            })
-
-        return rows
-
-    # --------------------------------------------------------------
-    # Replace persisted words for a segment
-    # --------------------------------------------------------------
-
-    @staticmethod
-    def _replace_words(
-        session,
-        TranscriptWord,
-        segment,
-        job_id,
-        rows,
-    ):
-        from sqlmodel import delete
-
-        session.exec(
-            delete(TranscriptWord).where(
-                TranscriptWord.segment_id == segment.id
-            )
-        )
-
-        for row in rows:
-            session.add(
-                TranscriptWord(
-                    job_id=job_id,
-                    segment_id=segment.id,
-                    word_index=row["word_index"],
-                    text=row["text"],
-                    start_seconds=row["start_seconds"],
-                    end_seconds=row["end_seconds"],
+    def _to_structured_items(timestamp_output: List[Any]) -> ForcedAlignResult:
+        items: List[ForcedAlignItem] = []
+        for item in timestamp_output:
+            if isinstance(item, dict):
+                text = item.get("text", "")
+                start_time = item.get("start_time", 0)
+                end_time = item.get("end_time", 0)
+            else:
+                text = getattr(item, "text", "")
+                start_time = getattr(item, "start_time", 0)
+                end_time = getattr(item, "end_time", 0)
+            items.append(
+                ForcedAlignItem(
+                    text=str(text),
+                    start_time=float(start_time),
+                    end_time=float(end_time),
                 )
             )
+        return ForcedAlignResult(items=items)
 
-        segment.alignment_status = "completed"
-        session.add(segment)
-
-    # --------------------------------------------------------------
-    # Mark segment failed
-    # --------------------------------------------------------------
-
-    @staticmethod
-    def _mark_segment_failed(
-        session,
-        TranscriptSegment,
-        segment_id,
-    ):
-        session.rollback()
-
-        segment = session.get(
-            TranscriptSegment,
-            segment_id,
-        )
-
-        if segment is not None:
-            segment.alignment_status = "failed"
-            session.add(segment)
-            session.commit()
-
-    # --------------------------------------------------------------
-    # Process one segment independently
-    # --------------------------------------------------------------
-
-    def _retry_segment(
+    def _decode_forced_alignment(
         self,
-        session,
-        TranscriptSegment,
-        TranscriptWord,
-        job_id,
-        segment_id,
-        segment_index,
-        source,
-        sample_rate,
-    ):
-        try:
-            segment = session.get(
-                TranscriptSegment,
-                segment_id,
-            )
+        *,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        word_lists: List[List[str]],
+    ) -> List[List[dict[str, Any]]]:
+        """Decode aligner logits using the stable subquadratic repair path."""
+        timestamp_segment_time = float(self.processor.timestamp_segment_time)
+        decoded: List[List[dict[str, Any]]] = []
 
-            if segment is None:
-                raise ValueError(
-                    f"Transcript segment disappeared: {segment_id}"
-                )
-
-            audio = self._read_audio_batch(
-                source,
-                [segment],
-                sample_rate,
-            )
-
-            results = self._align_batch(
-                audio,
-                [segment],
-            )
-
-            if len(results) != 1:
-                raise RuntimeError(
-                    "Expected exactly one alignment result"
-                )
-
-            rows = self._word_rows(
-                segment,
-                results[0],
-            )
-
-            self._replace_words(
-                session,
-                TranscriptWord,
-                segment,
-                job_id,
-                rows,
-            )
-
-            session.commit()
-
-            logger.info(
-                "Individual alignment succeeded "
-                "job=%s segment=%s",
-                job_id,
-                segment_index,
-            )
-
-            return True
-
-        except Exception as exc:
-            session.rollback()
-
-            logger.warning(
-                "Individual alignment failed "
-                "job=%s segment=%s error=%s",
-                job_id,
-                segment_index,
-                str(exc)[:1000],
-                exc_info=True,
-            )
-
-            try:
-                self._mark_segment_failed(
-                    session,
-                    TranscriptSegment,
-                    segment_id,
-                )
-            except Exception:
-                session.rollback()
-
-                logger.exception(
-                    "Could not mark segment failed "
-                    "job=%s segment=%s",
-                    job_id,
-                    segment_index,
-                )
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            return False
-
-    # --------------------------------------------------------------
-    # Main task handler
-    # --------------------------------------------------------------
-
-    @task_handler(name="process")
-    def process(self, data):
-        from sqlmodel import Session, func, select
-
-        from db.db import engine
-        from db.models import (
-            Job,
-            JobStage,
-            JobStatus,
-            TranscriptSegment,
-            TranscriptWord,
-            utc_now,
-        )
-
-        if not isinstance(data, dict) or not data.get("job_id"):
-            raise ValueError(
-                "Expected payload containing job_id"
-            )
-
-        job_id = UUID(str(data["job_id"]))
-
-        started = time.perf_counter()
-        temp_audio_path = None
-
-        try:
-            with Session(engine) as session:
-
-                # --------------------------------------------------
-                # Load job
-                # --------------------------------------------------
-
-                job = session.exec(
-                    select(Job).where(
-                        Job.id == job_id
-                    )
-                ).first()
-
-                if job is None:
-                    raise ValueError(
-                        f"Job not found: {job_id}"
-                    )
-
-                if job.status == JobStatus.FAILED:
-                    return {
-                        "job_id": str(job_id),
-                        "status": "failed",
+        for sample_index, words in enumerate(word_lists):
+            timestamp_mask = input_ids[sample_index] == self.timestamp_token_id
+            timestamp_logits = logits[sample_index][timestamp_mask]
+            timestamp_bins = _decode_timestamp_bins(timestamp_logits)
+            fixed_milliseconds = [value * timestamp_segment_time for value in timestamp_bins]
+            decoded.append(
+                [
+                    {
+                        "text": word,
+                        "start_time": round(fixed_milliseconds[word_index * 2] / 1000.0, 3),
+                        "end_time": round(fixed_milliseconds[word_index * 2 + 1] / 1000.0, 3),
                     }
-
-                audio_object_key = getattr(
-                    job,
-                    "audio_object_key",
-                    None,
-                )
-
-                audio_path = getattr(
-                    job,
-                    "audio_path",
-                    None,
-                )
-
-                # --------------------------------------------------
-                # Download audio from MinIO if applicable
-                # --------------------------------------------------
-
-                if audio_object_key:
-                    temp_audio_path = self._download_audio(
-                        audio_object_key
-                    )
-
-                    audio_path = temp_audio_path
-
-                if (
-                    not audio_path
-                    or not os.path.isfile(audio_path)
-                ):
-                    raise FileNotFoundError(
-                        "Audio is unavailable"
-                    )
-
-                # --------------------------------------------------
-                # Update job state
-                # --------------------------------------------------
-
-                job.status = JobStatus.PROCESSING
-                job.stage = JobStage.ALIGN
-                job.error = None
-                job.updated_at = utc_now()
-
-                session.add(job)
-                session.commit()
-
-                # --------------------------------------------------
-                # Load pending segments
-                # --------------------------------------------------
-
-                segments = session.exec(
-                    select(TranscriptSegment)
-                    .where(
-                        TranscriptSegment.job_id == job_id
-                    )
-                    .where(
-                        TranscriptSegment.text.is_not(None)
-                    )
-                    .where(
-                        TranscriptSegment.text != ""
-                    )
-                    .where(
-                        TranscriptSegment.alignment_status
-                        != "completed"
-                    )
-                    .where(
-                        TranscriptSegment.alignment_status
-                        != "skipped"
-                    )
-                    .order_by(
-                        TranscriptSegment.segment_index
-                    )
-                ).all()
-
-                logger.info(
-                    "Alignment started job=%s "
-                    "pending_segments=%d batch_size=%d",
-                    job_id,
-                    len(segments),
-                    ALIGN_BATCH_SIZE,
-                )
-
-                # --------------------------------------------------
-                # Process audio batches
-                # --------------------------------------------------
-
-                with sf.SoundFile(str(audio_path)) as source:
-                    sample_rate = int(source.samplerate)
-
-                    for batch_number, batch in enumerate(
-                        batched(
-                            segments,
-                            ALIGN_BATCH_SIZE,
-                        ),
-                        start=1,
-                    ):
-                        # Classify segments before touching the model:
-                        #   missing language     -> failed
-                        #   unsupported language -> skipped
-                        valid = []
-                        changed = False
-
-                        for segment in batch:
-                            if not segment.language:
-                                segment.alignment_status = "failed"
-                                session.add(segment)
-                                changed = True
-
-                                logger.warning(
-                                    "Segment=%s failed: "
-                                    "language is missing",
-                                    segment.segment_index,
-                                )
-
-                            elif aligner_language(
-                                segment.language
-                            ) is None:
-                                segment.alignment_status = "skipped"
-                                session.add(segment)
-                                changed = True
-
-                                logger.warning(
-                                    "Segment=%s skipped: language "
-                                    "%r is not supported by the "
-                                    "aligner",
-                                    segment.segment_index,
-                                    segment.language,
-                                )
-
-                            else:
-                                valid.append(segment)
-
-                        if changed:
-                            session.commit()
-
-                        if not valid:
-                            continue
-
-                        batch_started = time.perf_counter()
-
-                        try:
-                            # Read audio.
-                            audio_batch = self._read_audio_batch(
-                                source,
-                                valid,
-                                sample_rate,
-                            )
-
-                            # Run forced alignment.
-                            results = self._align_batch(
-                                audio_batch,
-                                valid,
-                            )
-
-                            # Validate all results before DB writes.
-                            prepared = [
-                                (
-                                    segment,
-                                    self._word_rows(
-                                        segment,
-                                        result,
-                                    ),
-                                )
-                                for segment, result in zip(
-                                    valid,
-                                    results,
-                                )
-                            ]
-
-                            # Persist successful batch.
-                            for segment, rows in prepared:
-                                self._replace_words(
-                                    session,
-                                    TranscriptWord,
-                                    segment,
-                                    job_id,
-                                    rows,
-                                )
-
-                            job.updated_at = utc_now()
-                            session.add(job)
-                            session.commit()
-
-                            logger.info(
-                                "Alignment batch succeeded "
-                                "job=%s batch=%d segments=%d "
-                                "elapsed=%.2fs",
-                                job_id,
-                                batch_number,
-                                len(valid),
-                                time.perf_counter() - batch_started,
-                            )
-
-                        except Exception:
-                            session.rollback()
-
-                            logger.exception(
-                                "Alignment batch failed; "
-                                "retrying individually "
-                                "job=%s batch=%d",
-                                job_id,
-                                batch_number,
-                            )
-
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-
-                            # Save IDs before retrying because the
-                            # transaction rollback expires ORM state.
-                            retry_items = [
-                                (
-                                    segment.id,
-                                    segment.segment_index,
-                                )
-                                for segment in valid
-                            ]
-
-                            for segment_id, segment_index in retry_items:
-                                self._retry_segment(
-                                    session=session,
-                                    TranscriptSegment=TranscriptSegment,
-                                    TranscriptWord=TranscriptWord,
-                                    job_id=job_id,
-                                    segment_id=segment_id,
-                                    segment_index=segment_index,
-                                    source=source,
-                                    sample_rate=sample_rate,
-                                )
-
-                # --------------------------------------------------
-                # Calculate persisted counts
-                # --------------------------------------------------
-
-                completed_count = session.exec(
-                    select(func.count())
-                    .select_from(TranscriptSegment)
-                    .where(
-                        TranscriptSegment.job_id == job_id
-                    )
-                    .where(
-                        TranscriptSegment.alignment_status
-                        == "completed"
-                    )
-                ).one()
-
-                failed_count = session.exec(
-                    select(func.count())
-                    .select_from(TranscriptSegment)
-                    .where(
-                        TranscriptSegment.job_id == job_id
-                    )
-                    .where(
-                        TranscriptSegment.alignment_status
-                        == "failed"
-                    )
-                ).one()
-
-                skipped_count = session.exec(
-                    select(func.count())
-                    .select_from(TranscriptSegment)
-                    .where(
-                        TranscriptSegment.job_id == job_id
-                    )
-                    .where(
-                        TranscriptSegment.alignment_status
-                        == "skipped"
-                    )
-                ).one()
-
-                # --------------------------------------------------
-                # Finalize job
-                # --------------------------------------------------
-
-                job = session.exec(
-                    select(Job).where(
-                        Job.id == job_id
-                    )
-                ).first()
-
-                if job is None:
-                    raise ValueError(
-                        f"Job disappeared: {job_id}"
-                    )
-
-                now = utc_now()
-
-                job.status = JobStatus.COMPLETED
-                job.stage = JobStage.COMPLETED
-                job.updated_at = now
-
-                if job.completed_at is None:
-                    job.completed_at = now
-
-                notes = []
-
-                if failed_count:
-                    notes.append(f"{failed_count} failed")
-
-                if skipped_count:
-                    notes.append(
-                        f"{skipped_count} skipped "
-                        "(unsupported language)"
-                    )
-
-                job.error = (
-                    "Alignment completed with "
-                    + ", ".join(notes)
-                    + " segments."
-                    if notes
-                    else None
-                )
-
-                session.add(job)
-                session.commit()
-
-            # ------------------------------------------------------
-            # Return result
-            # ------------------------------------------------------
-
-            elapsed = time.perf_counter() - started
-
-            logger.info(
-                "Alignment finished job=%s "
-                "aligned=%d failed=%d elapsed=%.2fs",
-                job_id,
-                completed_count,
-                failed_count,
-                elapsed,
+                    for word_index, word in enumerate(words)
+                ]
             )
 
-            return {
-                "job_id": str(job_id),
-                "status": "completed",
-                "aligned_segments": completed_count,
-                "failed_segments": failed_count,
-                "elapsed_seconds": round(elapsed, 2),
-            }
+        return decoded
 
-        except Exception as exc:
-            logger.exception(
-                "Alignment job failed job=%s",
-                job_id,
+    @torch.inference_mode()
+    def align(
+        self,
+        audio: Union[AudioLike, List[AudioLike]],
+        text: Union[str, List[str]],
+        language: Union[str, List[str]],
+    ) -> List[ForcedAlignResult]:
+        texts = ensure_list(text)
+        languages = ensure_list(language)
+        audios = normalize_audios(audio)
+
+        if len(texts) == 1 and len(audios) > 1:
+            texts = texts * len(audios)
+        if len(languages) == 1 and len(audios) > 1:
+            languages = languages * len(audios)
+        if not (len(audios) == len(texts) == len(languages)):
+            raise ValueError(
+                f"Batch size mismatch: audio={len(audios)}, text={len(texts)}, "
+                f"language={len(languages)}"
             )
 
-            # Keep the job in PROCESSING so the task system can
-            # retry it if configured to do so. Do not mark it FAILED
-            # prematurely when the task may be retried.
-            try:
-                with Session(engine) as session:
-                    job = session.exec(
-                        select(Job).where(
-                            Job.id == job_id
-                        )
-                    ).first()
+        inputs, word_lists = self.processor.prepare_forced_aligner_inputs(
+            audio=audios,
+            transcript=texts,
+            language=languages,
+        )
+        inputs = inputs.to(self.model.device).to(self.model.dtype)
+        outputs = self.model(**inputs)
+        decoded = self._decode_forced_alignment(
+            logits=outputs.logits,
+            input_ids=inputs["input_ids"],
+            word_lists=word_lists,
+        )
+        return [self._to_structured_items(items) for items in decoded]
 
-                    if (
-                        job is not None
-                        and job.status != JobStatus.FAILED
-                    ):
-                        job.status = JobStatus.PROCESSING
-                        job.stage = JobStage.ALIGN
-                        job.error = str(exc)[:4000]
-                        job.updated_at = utc_now()
-
-                        session.add(job)
-                        session.commit()
-
-            except Exception:
-                logger.exception(
-                    "Could not update job error state job=%s",
-                    job_id,
-                )
-
-            raise
-
-        finally:
-            if temp_audio_path:
-                try:
-                    os.unlink(temp_audio_path)
-                except OSError:
-                    logger.warning(
-                        "Could not remove temporary audio: %s",
-                        temp_audio_path,
-                    )
-
-
-# ------------------------------------------------------------------
-# Ray Serve application
-# ------------------------------------------------------------------
-
-app = AlignConsumer.bind()
+    def get_supported_languages(self) -> Optional[List[str]]:
+        fn = getattr(self.model, "get_support_languages", None)
+        if not callable(fn):
+            return None
+        languages = fn()
+        if languages is None:
+            return None
+        return sorted({str(language).lower() for language in languages})
