@@ -11,3 +11,5 @@ soundfile
 numpy
 transformers
 nagisa
+
+librosa
