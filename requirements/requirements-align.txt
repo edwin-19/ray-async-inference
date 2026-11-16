@@ -1,5 +1,5 @@
 
-qwen-asr
+# qwen-asr
 ray[serve]==2.59.0
 celery[redis]
 redis

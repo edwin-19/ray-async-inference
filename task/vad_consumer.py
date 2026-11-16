@@ -143,7 +143,7 @@ class VadConsumer:
             )
 
         config = FireRedVadConfig(
-            use_gpu=True,
+            use_gpu=False,
             smooth_window_size=5,
             speech_threshold=0.5,
             min_speech_frame=10,

@@ -1,56 +1,97 @@
 
 import logging
 import os
-import tempfile
 import time
-from collections import Counter
-from itertools import islice
 from pathlib import Path
-from urllib.parse import quote
+from itertools import islice
 from uuid import UUID
 
-import boto3
+import numpy as np
 import soundfile as sf
-from dotenv import load_dotenv
+import torch
+from scipy.signal import resample_poly
+
 from celery import Celery
+from dotenv import load_dotenv
+
 from ray import serve
 from ray.serve.config import AutoscalingConfig
-from ray.serve.schema import CeleryAdapterConfig, TaskProcessorConfig
-from ray.serve.task_consumer import task_consumer, task_handler
+from ray.serve.schema import (
+    CeleryAdapterConfig,
+    TaskProcessorConfig,
+)
+from ray.serve.task_consumer import (
+    task_consumer,
+    task_handler,
+)
+
+import boto3
+from urllib.parse import quote
+
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("asr.consumer")
+logger = logging.getLogger("align.consumer")
 
 
 # ---------------------------------------------------------------------
-# Queue / model configuration
+# Configuration
 # ---------------------------------------------------------------------
 
-ASR_QUEUE = os.getenv("ASR_QUEUE", "asr_queue")
 ALIGN_QUEUE = os.getenv("ALIGN_QUEUE", "align_queue")
-ASR_FAILED_QUEUE = os.getenv("ASR_FAILED_QUEUE", "asr_failed_queue")
-
-ASR_MODEL_NAME = os.getenv(
-    "ASR_MODEL_NAME",
-    "Qwen/Qwen3-ASR-1.7B",
+ALIGN_FAILED_QUEUE = os.getenv(
+    "ALIGN_FAILED_QUEUE",
+    "align_failed_queue",
 )
 
-ASR_DEFAULT_LANGUAGE = (
-    os.getenv("ASR_LANGUAGE", "").strip() or None
+ALIGN_MODEL_NAME = os.getenv(
+    "ALIGN_MODEL_NAME",
+    "Qwen/Qwen3-ForcedAligner-0.6B-hf",
 )
 
-ASR_BATCH_SIZE = max(1, int(os.getenv("ASR_BATCH_SIZE", "8")))
-ASR_MAX_RETRIES = max(0, int(os.getenv("ASR_MAX_RETRIES", "3")))
-
-ASR_NUM_GPUS = float(
-    os.getenv("ASR_NUM_GPUS_PER_REPLICA", "1")
+ALIGN_BATCH_SIZE = max(
+    1,
+    int(os.getenv("ALIGN_BATCH_SIZE", "4")),
 )
 
-ASR_NUM_CPUS = int(
-    os.getenv("ASR_NUM_CPUS_PER_REPLICA", "2")
+ALIGN_MAX_RETRIES = max(
+    0,
+    int(os.getenv("ALIGN_MAX_RETRIES", "3")),
 )
+
+ALIGN_NUM_GPUS = float(
+    os.getenv("ALIGN_NUM_GPUS_PER_REPLICA", "1")
+)
+
+ALIGN_NUM_CPUS = int(
+    os.getenv("ALIGN_NUM_CPUS_PER_REPLICA", "2")
+)
+
+ALIGN_DTYPE = os.getenv("ALIGN_DTYPE", "bfloat16")
+
+ALIGN_DEVICE = os.getenv("ALIGN_DEVICE", "cuda")
+
+ALIGN_SAMPLE_RATE = 16000
+
+ALIGN_UNSUPPORTED_POLICY = os.getenv(
+    "ALIGN_UNSUPPORTED_POLICY",
+    "skip",
+).lower()
+
+
+SUPPORTED_LANGUAGES = {
+    "zh": "Chinese",
+    "en": "English",
+    "yue": "Cantonese",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "es": "Spanish",
+}
 
 
 def redis_url(db: int) -> str:
@@ -71,23 +112,19 @@ REDIS_BROKER_URL = redis_url(0)
 REDIS_BACKEND_URL = redis_url(1)
 
 
-# ---------------------------------------------------------------------
-# Ray task processor configuration
-# ---------------------------------------------------------------------
-
 processor_config = TaskProcessorConfig(
-    queue_name=ASR_QUEUE,
+    queue_name=ALIGN_QUEUE,
     adapter_config=CeleryAdapterConfig(
         broker_url=REDIS_BROKER_URL,
         backend_url=REDIS_BACKEND_URL,
     ),
-    max_retries=ASR_MAX_RETRIES,
-    failed_task_queue_name=ASR_FAILED_QUEUE,
+    max_retries=ALIGN_MAX_RETRIES,
+    failed_task_queue_name=ALIGN_FAILED_QUEUE,
 )
 
 
 # ---------------------------------------------------------------------
-# MinIO configuration
+# MinIO
 # ---------------------------------------------------------------------
 
 MINIO_ENDPOINT = os.getenv(
@@ -95,7 +132,10 @@ MINIO_ENDPOINT = os.getenv(
     "127.0.0.1:9000",
 )
 
-MINIO_BUCKET = os.getenv("MINIO_BUCKET", "speech-data")
+MINIO_BUCKET = os.getenv(
+    "MINIO_BUCKET",
+    "speech-data",
+)
 
 MINIO_ACCESS_KEY = os.getenv(
     "MINIO_ACCESS_KEY",
@@ -118,12 +158,6 @@ def create_minio_client():
     if not endpoint.startswith(("http://", "https://")):
         scheme = "https" if MINIO_SECURE else "http"
         endpoint = f"{scheme}://{endpoint}"
-
-    if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
-        raise ValueError(
-            "Set MINIO_ACCESS_KEY and MINIO_SECRET_KEY, "
-            "or MINIO_ROOT_USER and MINIO_ROOT_PASSWORD."
-        )
 
     return boto3.client(
         "s3",
@@ -150,97 +184,171 @@ def batched(items, batch_size):
         yield batch
 
 
-def result_fields(result):
-    if isinstance(result, dict):
-        text = result.get("text", "")
-        language = result.get("language")
-    else:
-        text = getattr(result, "text", "")
-        language = getattr(result, "language", None)
-
-    text = str(text or "").strip()
-    language = str(language).strip() if language else None
-
-    return text, language
-
-
 def normalize_language(language):
-    if language is None:
+    if not language:
         return None
 
     language = str(language).strip()
-    return language or None
+
+    if not language:
+        return None
+
+    # Accept either language code or full language name.
+    for code, name in SUPPORTED_LANGUAGES.items():
+        if language.lower() in (code, name.lower()):
+            return name
+
+    return None
 
 
-def enum_value(value):
-    return value.value if hasattr(value, "value") else str(value)
+def load_audio_segment(
+    source,
+    start_seconds,
+    end_seconds,
+):
+    sample_rate = source.samplerate
+
+    start_frame = max(
+        0,
+        int(start_seconds * sample_rate),
+    )
+
+    end_frame = min(
+        len(source),
+        int(end_seconds * sample_rate),
+    )
+
+    if end_frame <= start_frame:
+        raise ValueError(
+            f"Invalid audio range: "
+            f"{start_seconds}-{end_seconds}"
+        )
+
+    source.seek(start_frame)
+
+    audio = source.read(
+        frames=end_frame - start_frame,
+        dtype="float32",
+        always_2d=False,
+    )
+
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+
+    if len(audio) == 0:
+        raise ValueError("Empty audio segment")
+
+    # Qwen3 ForcedAligner expects 16 kHz audio.
+    if sample_rate != ALIGN_SAMPLE_RATE:
+        from math import gcd
+
+        divisor = gcd(sample_rate, ALIGN_SAMPLE_RATE)
+
+        audio = resample_poly(
+            audio,
+            ALIGN_SAMPLE_RATE // divisor,
+            sample_rate // divisor,
+        ).astype(np.float32)
+
+    return audio
 
 
 # ---------------------------------------------------------------------
-# ASR deployment
+# Deployment
 # ---------------------------------------------------------------------
 
 @serve.deployment(
-    name="asr-consumer",
+    name="align-consumer",
     max_ongoing_requests=1,
     ray_actor_options={
-        "num_cpus": ASR_NUM_CPUS,
-        "num_gpus": ASR_NUM_GPUS,
+        "num_cpus": ALIGN_NUM_CPUS,
+        "num_gpus": ALIGN_NUM_GPUS,
     },
     autoscaling_config=AutoscalingConfig(
-        min_replicas=int(os.getenv("ASR_MIN_REPLICAS", "1")),
-        max_replicas=int(os.getenv("ASR_MAX_REPLICAS", "1")),
-        target_ongoing_requests=int(os.getenv("ASR_TARGET_ONGOING_REQUESTS", "1")),
+        min_replicas=int(
+            os.getenv("ALIGN_MIN_REPLICAS", "1")
+        ),
+        max_replicas=int(
+            os.getenv("ALIGN_MAX_REPLICAS", "1")
+        ),
+        target_ongoing_requests=int(
+            os.getenv("ALIGN_TARGET_ONGOING_REQUESTS", "1")
+        ),
     ),
 )
 @task_consumer(task_processor_config=processor_config)
-class ASRConsumer:
+class AlignmentConsumer:
 
     def __init__(self):
-        from qwen_asr import Qwen3ASRModel
 
-        gpu_memory_utilization = float(
-            os.getenv("ASR_GPU_MEMORY_UTILIZATION", "0.85")
+        # -------------------------------------------------------------
+        # 1. Initialize model
+        # -------------------------------------------------------------
+
+        logger.info(
+            "Loading forced aligner model=%s batch_size=%d",
+            ALIGN_MODEL_NAME,
+            ALIGN_BATCH_SIZE,
+        )
+
+        from transformers import (
+            AutoProcessor,
+            AutoModelForTokenClassification,
+        )
+
+        self.device = torch.device(
+            ALIGN_DEVICE
+            if ALIGN_DEVICE == "cpu" or torch.cuda.is_available()
+            else "cpu"
+        )
+
+        self.dtype = (
+            torch.bfloat16
+            if ALIGN_DTYPE == "bfloat16"
+            else torch.float16
+        )
+
+        self.processor = AutoProcessor.from_pretrained(
+            ALIGN_MODEL_NAME,
+        )
+
+        self.model = (
+            AutoModelForTokenClassification.from_pretrained(
+                ALIGN_MODEL_NAME,
+                dtype=self.dtype if self.device.type == "cuda"
+                else torch.float32,
+            )
+            .to(self.device)
+            .eval()
         )
 
         logger.info(
-            "Loading ASR model=%s backend=vLLM batch_size=%d "
-            "gpu_memory_utilization=%.2f",
-            ASR_MODEL_NAME,
-            ASR_BATCH_SIZE,
-            gpu_memory_utilization,
+            "Forced aligner loaded device=%s dtype=%s",
+            self.device,
+            next(self.model.parameters()).dtype,
         )
 
-        self.model = Qwen3ASRModel.LLM(
-            model=ASR_MODEL_NAME,
-            max_inference_batch_size=ASR_BATCH_SIZE,
-            max_model_len=5096,
-            max_new_tokens=1028,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_num_seqs=ASR_BATCH_SIZE,
-        )
+        # -------------------------------------------------------------
+        # 2. Initialize MinIO
+        # -------------------------------------------------------------
 
         self.minio = create_minio_client()
 
-        logger.info("vLLM ASR model loaded")
-
-        logger.info(
-            "MinIO configured: endpoint=%s bucket=%s",
-            MINIO_ENDPOINT,
-            MINIO_BUCKET,
-        )
-
     # -----------------------------------------------------------------
-    # Audio helpers
+    # Audio download
     # -----------------------------------------------------------------
 
-    def _download_audio(self, object_key: str) -> str:
+    def _download_audio(self, object_key):
+
         suffix = Path(object_key).suffix or ".audio"
 
+        import tempfile
+
         fd, local_path = tempfile.mkstemp(
-            prefix="asr-",
+            prefix="align-",
             suffix=suffix,
         )
+
         os.close(fd)
 
         try:
@@ -250,119 +358,127 @@ class ASRConsumer:
                 local_path,
             )
 
-            logger.info(
-                "Downloaded audio from MinIO: bucket=%s key=%s",
-                MINIO_BUCKET,
-                object_key,
-            )
-
             return local_path
 
         except Exception:
             Path(local_path).unlink(missing_ok=True)
-
-            logger.exception(
-                "MinIO download failed: bucket=%s key=%s",
-                MINIO_BUCKET,
-                object_key,
-            )
-
             raise
 
-    def _read_segment_batch(
-        self,
-        source,
-        segments,
-        sample_rate,
-    ):
-        audio_batch = []
+    # -----------------------------------------------------------------
+    # Model inference
+    # -----------------------------------------------------------------
 
-        for segment in segments:
-            start_frame = max(
-                0,
-                int(segment.start_seconds * sample_rate),
-            )
+    def _align_batch(self, audio_batch, transcript_batch, languages):
 
-            end_frame = min(
-                len(source),
-                max(
-                    start_frame,
-                    int(segment.end_seconds * sample_rate),
-                ),
-            )
-
-            if end_frame <= start_frame:
-                raise ValueError(
-                    f"Invalid audio range for segment "
-                    f"{segment.segment_index}: "
-                    f"{start_frame}:{end_frame}"
-                )
-
-            source.seek(start_frame)
-
-            audio = source.read(
-                frames=end_frame - start_frame,
-                dtype="float32",
-                always_2d=False,
-            )
-
-            if audio.ndim == 2:
-                audio = audio.mean(axis=1)
-
-            if len(audio) == 0:
-                raise ValueError(
-                    f"Empty audio for segment "
-                    f"{segment.segment_index}"
-                )
-
-            audio_batch.append((audio, sample_rate))
-
-        return audio_batch
-
-    def _transcribe_batch(
-        self,
-        audio_batch,
-        language=None,
-    ):
         if not audio_batch:
             return []
 
         started = time.perf_counter()
 
-        effective_language = normalize_language(language)
-
-        if effective_language is None:
-            effective_language = ASR_DEFAULT_LANGUAGE
-
-        results = self.model.transcribe(
-            audio=audio_batch,
-            language=effective_language,
+        # Audio must be 16 kHz mono float32.
+        # Unsupported languages are handled by the caller.
+        aligner_inputs, word_lists = (
+            self.processor.prepare_forced_aligner_inputs(
+                audio=audio_batch,
+                transcript=transcript_batch,
+                language=languages,
+            )
         )
 
-        if not isinstance(results, list):
-            raise RuntimeError(
-                f"Expected list of ASR results, got "
-                f"{type(results).__name__}"
-            )
+        aligner_inputs = aligner_inputs.to(
+            self.device,
+            dtype=self.dtype if self.device.type == "cuda"
+            else torch.float32,
+        )
 
-        if len(results) != len(audio_batch):
+        with torch.inference_mode():
+            outputs = self.model(**aligner_inputs)
+
+        timestamps = self.processor.decode_forced_alignment(
+            logits=outputs.logits,
+            input_ids=aligner_inputs["input_ids"],
+            word_lists=word_lists,
+            timestamp_token_id=self.model.config.timestamp_token_id,
+        )
+
+        if len(timestamps) != len(audio_batch):
             raise RuntimeError(
-                f"ASR result count mismatch: "
+                "Alignment result count mismatch: "
                 f"submitted={len(audio_batch)}, "
-                f"received={len(results)}"
+                f"received={len(timestamps)}"
             )
 
         logger.info(
-            "ASR inference batch_size=%d language=%s elapsed=%.2fs",
+            "Alignment inference batch=%d elapsed=%.2fs",
             len(audio_batch),
-            effective_language or "auto",
             time.perf_counter() - started,
         )
 
-        return [
-            result_fields(result)
-            for result in results
-        ]
+        return timestamps
+
+    # -----------------------------------------------------------------
+    # Persistence adapter
+    # -----------------------------------------------------------------
+
+    def _persist_word_alignments(
+        self,
+        session,
+        segment,
+        timestamps,
+        utc_now,
+    ):
+        """
+        Persist word-level alignment results.
+
+        Recommended storage:
+            TranscriptWord
+                id
+                job_id
+                segment_id
+                word_index
+                text
+                start_seconds
+                end_seconds
+
+        Timestamp values returned by Qwen are relative to
+        the supplied audio segment.
+
+        Convert them into absolute job-level timestamps.
+        """
+
+        from db.models import TranscriptWord
+
+        # Replace existing results for this segment so that
+        # task retries remain idempotent.
+
+        existing = session.exec(
+            select(TranscriptWord).where(
+                TranscriptWord.segment_id == segment.id
+            )
+        ).all()
+
+        for item in existing:
+            session.delete(item)
+
+        for index, item in enumerate(timestamps):
+
+            word = TranscriptWord(
+                job_id=segment.job_id,
+                segment_id=segment.id,
+                word_index=index,
+                text=item["text"],
+                start_seconds=(
+                    segment.start_seconds + item["start_time"]
+                ),
+                end_seconds=(
+                    segment.start_seconds + item["end_time"]
+                ),
+            )
+
+            session.add(word)
+
+        # The caller owns the transaction and commits.
+
 
     # -----------------------------------------------------------------
     # Main task
@@ -370,6 +486,7 @@ class ASRConsumer:
 
     @task_handler(name="process")
     def process(self, data):
+
         from sqlmodel import Session, select
 
         from db.db import engine
@@ -382,57 +499,41 @@ class ASRConsumer:
         )
 
         if not isinstance(data, dict) or not data.get("job_id"):
-            raise ValueError("Expected payload containing job_id")
+            raise ValueError(
+                "Expected payload containing job_id"
+            )
 
         job_id = UUID(str(data["job_id"]))
+
         started = time.perf_counter()
-
-        publisher = Celery(
-            "align_dispatch",
-            broker=REDIS_BROKER_URL,
-            backend=REDIS_BACKEND_URL,
-        )
-
         temp_audio_path = None
-        fallback_to_full_audio = False
-        total_segments = 0
 
         try:
 
             # ---------------------------------------------------------
-            # 1. Resolve job and requested language
+            # 1. Resolve job
             # ---------------------------------------------------------
 
             with Session(engine) as session:
+
                 job = session.get(Job, job_id)
 
                 if job is None:
-                    raise ValueError(f"Job not found: {job_id}")
+                    raise ValueError(
+                        f"Job not found: {job_id}"
+                    )
 
                 if job.status in (
                     JobStatus.COMPLETED,
                     JobStatus.FAILED,
                 ):
-                    logger.info(
-                        "Skipping terminal job=%s status=%s",
-                        job_id,
-                        enum_value(job.status),
-                    )
-
                     return {
                         "job_id": str(job_id),
                         "status": enum_value(job.status),
                     }
 
-                requested_language = normalize_language(
-                    getattr(job, "requested_language", None)
-                )
-
-                if requested_language is None:
-                    requested_language = ASR_DEFAULT_LANGUAGE
-
                 audio_object_key = (
-                    getattr(job, "audio_object_key", None)
+                    job.audio_object_key
                     or data.get("audio_object_key")
                 )
 
@@ -443,32 +544,28 @@ class ASRConsumer:
                 )
 
                 job.status = JobStatus.PROCESSING
-                job.stage = JobStage.ASR
+                job.stage = JobStage.ALIGN
                 job.error = None
-
-                if job.started_at is None:
-                    job.started_at = utc_now()
-
                 job.updated_at = utc_now()
 
                 session.add(job)
                 session.commit()
 
-            logger.info(
-                "Starting ASR job=%s requested_language=%s",
-                job_id,
-                requested_language or "auto",
-            )
+                job_language = (
+                    getattr(job, "language", None)
+                    or getattr(job, "requested_language", None)
+                )
+
+                job_transcript = job.transcript
 
             # ---------------------------------------------------------
-            # 2. Resolve audio file
+            # 2. Resolve audio
             # ---------------------------------------------------------
 
             if audio_object_key:
                 temp_audio_path = self._download_audio(
                     str(audio_object_key)
                 )
-
                 audio_path = Path(temp_audio_path)
 
             elif legacy_audio_path:
@@ -476,17 +573,14 @@ class ASRConsumer:
 
             else:
                 raise ValueError(
-                    f"Job {job_id} has neither audio_object_key "
-                    "nor audio_path"
+                    f"Job {job_id} has no audio source"
                 )
 
             if not audio_path.is_file():
-                raise FileNotFoundError(
-                    f"Audio file not found: {audio_path}"
-                )
+                raise FileNotFoundError(audio_path)
 
             # ---------------------------------------------------------
-            # 3. Load VAD segments
+            # 3. Load segments
             # ---------------------------------------------------------
 
             with Session(engine) as session:
@@ -501,321 +595,209 @@ class ASRConsumer:
                     )
                 ).all()
 
+                # For jobs without VAD segments, use the full
+                # transcript as a single alignment input.
                 fallback_to_full_audio = not segments
 
                 if fallback_to_full_audio:
-                    logger.warning(
-                        "No VAD segments found for job=%s. "
-                        "Falling back to full audio transcription.",
-                        job_id,
-                    )
+                    if not job_transcript:
+                        raise ValueError(
+                            "No transcript available for alignment"
+                        )
 
-                    total_segments = 1
-                    pending_indexes = []
+                    alignment_items = [{
+                        "segment": None,
+                        "text": job_transcript,
+                        "start": 0.0,
+                        "end": None,
+                        "language": job_language,
+                    }]
 
                 else:
-                    total_segments = len(segments)
-
-                    pending_indexes = [
-                        segment.segment_index
+                    alignment_items = [
+                        {
+                            "segment": segment,
+                            "text": segment.text,
+                            "start": segment.start_seconds,
+                            "end": segment.end_seconds,
+                            "language": (
+                                segment.language or job_language
+                            ),
+                        }
                         for segment in segments
-                        if segment.text is None
+                        if segment.text and segment.text.strip()
                     ]
 
                 logger.info(
-                    "ASR job=%s total=%d pending=%d "
-                    "fallback_to_full_audio=%s batch_size=%d "
-                    "language=%s",
+                    "Starting alignment job=%s segments=%d "
+                    "fallback=%s",
                     job_id,
-                    total_segments,
-                    len(pending_indexes),
+                    len(alignment_items),
                     fallback_to_full_audio,
-                    ASR_BATCH_SIZE,
-                    requested_language or "auto",
                 )
 
                 # -----------------------------------------------------
-                # 4. ASR inference
+                # 4. Prepare audio and alignment batches
                 # -----------------------------------------------------
 
                 with sf.SoundFile(str(audio_path)) as source:
 
-                    sample_rate = source.samplerate
+                    prepared_items = []
 
-                    if sample_rate <= 0:
-                        raise ValueError(
-                            f"Invalid sample rate for job {job_id}"
+                    for item in alignment_items:
+
+                        language = normalize_language(
+                            item["language"]
                         )
 
-                    if fallback_to_full_audio:
-
-                        # Full-audio fallback.
-                        source.seek(0)
-
-                        audio = source.read(
-                            dtype="float32",
-                            always_2d=False,
-                        )
-
-                        if audio.ndim == 2:
-                            audio = audio.mean(axis=1)
-
-                        if len(audio) == 0:
-                            raise ValueError(
-                                f"Empty audio file for job {job_id}"
-                            )
-
-                        audio_duration = len(audio) / sample_rate
-
-                        logger.info(
-                            "Full-audio fallback job=%s "
-                            "duration=%.2fs sample_rate=%d",
-                            job_id,
-                            audio_duration,
-                            sample_rate,
-                        )
-
-                        results = self._transcribe_batch(
-                            [(audio, sample_rate)],
-                            language=requested_language,
-                        )
-
-                        text, detected_language = results[0]
-
-                        job = session.get(Job, job_id)
-
-                        if job is None:
-                            raise RuntimeError(
-                                f"Job disappeared during ASR: {job_id}"
-                            )
-
-                        job.transcript = text
-                        job.language = detected_language
-                        job.updated_at = utc_now()
-
-                        session.add(job)
-                        session.commit()
-
-                        logger.info(
-                            "Full-audio fallback completed "
-                            "job=%s language=%s transcript_length=%d",
-                            job_id,
-                            detected_language or "unknown",
-                            len(text),
-                        )
-
-                    else:
-
-                        # Normal VAD-segmented batched ASR.
-
-                        for batch_number, batch_indexes in enumerate(
-                            batched(
-                                pending_indexes,
-                                ASR_BATCH_SIZE,
-                            ),
-                            start=1,
-                        ):
-
-                            batch_started = time.perf_counter()
-
-                            batch_segments = session.exec(
-                                select(TranscriptSegment)
-                                .where(
-                                    TranscriptSegment.job_id == job_id,
-                                    TranscriptSegment.segment_index.in_(
-                                        batch_indexes
-                                    ),
+                        if language is None:
+                            if item["language"] and (
+                                ALIGN_UNSUPPORTED_POLICY == "skip"
+                            ):
+                                logger.warning(
+                                    "Skipping unsupported language "
+                                    "job=%s language=%s",
+                                    job_id,
+                                    item["language"],
                                 )
-                                .order_by(
-                                    TranscriptSegment.segment_index
-                                )
-                            ).all()
 
-                            # Another retry may have completed
-                            # some segments already.
-
-                            batch_segments = [
-                                segment
-                                for segment in batch_segments
-                                if segment.text is None
-                            ]
-
-                            if not batch_segments:
                                 continue
 
-                            audio_batch = self._read_segment_batch(
-                                source,
-                                batch_segments,
-                                sample_rate,
-                            )
-
-                            results = self._transcribe_batch(
-                                audio_batch,
-                                language=requested_language,
-                            )
-
-                            for segment, (
-                                text,
-                                detected_language,
-                            ) in zip(batch_segments, results):
-
-                                segment.text = text
-                                segment.language = detected_language
-
-                                session.add(segment)
-
-                            job = session.get(Job, job_id)
-
-                            if job is None:
-                                raise RuntimeError(
-                                    f"Job disappeared during ASR: {job_id}"
+                            if item["language"] and (
+                                ALIGN_UNSUPPORTED_POLICY == "error"
+                            ):
+                                raise ValueError(
+                                    "Unsupported alignment language: "
+                                    f"{item['language']}"
                                 )
 
-                            job.updated_at = utc_now()
+                        end = (
+                            item["end"]
+                            if item["end"] is not None
+                            else len(source) / source.samplerate
+                        )
 
-                            session.add(job)
-                            session.commit()
+                        audio = load_audio_segment(
+                            source,
+                            item["start"],
+                            end,
+                        )
 
-                            completed_count = len(
-                                session.exec(
-                                    select(TranscriptSegment).where(
-                                        TranscriptSegment.job_id == job_id,
-                                        TranscriptSegment.text.is_not(None),
+                        prepared_items.append({
+                            **item,
+                            "audio": audio,
+                            "language": language,
+                        })
+
+                    # -------------------------------------------------
+                    # 5. Batched forced alignment
+                    # -------------------------------------------------
+
+                    for batch in batched(
+                        prepared_items,
+                        ALIGN_BATCH_SIZE,
+                    ):
+
+                        audio_batch = [
+                            item["audio"]
+                            for item in batch
+                        ]
+
+                        transcript_batch = [
+                            item["text"]
+                            for item in batch
+                        ]
+
+                        language_batch = [
+                            item["language"]
+                            for item in batch
+                        ]
+
+                        timestamps_batch = self._align_batch(
+                            audio_batch,
+                            transcript_batch,
+                            language_batch,
+                        )
+
+                        # -------------------------------------------------
+                        # 6. Persist batch
+                        # -------------------------------------------------
+
+                        with Session(engine) as write_session:
+
+                            for item, timestamps in zip(
+                                batch,
+                                timestamps_batch,
+                            ):
+
+                                if item["segment"] is None:
+                                    # Full-audio fallback:
+                                    # persist against the job-level
+                                    # transcript using a separate
+                                    # job-level word storage adapter.
+                                    self._persist_job_word_alignments(
+                                        write_session,
+                                        job_id,
+                                        timestamps,
                                     )
-                                ).all()
-                            )
+                                else:
+                                    self._persist_word_alignments(
+                                        write_session,
+                                        item["segment"],
+                                        timestamps,
+                                        utc_now,
+                                    )
 
-                            logger.info(
-                                "ASR progress job=%s batch=%d "
-                                "completed=%d/%d elapsed=%.2fs",
-                                job_id,
-                                batch_number,
-                                completed_count,
-                                total_segments,
-                                time.perf_counter() - batch_started,
-                            )
+                            write_session.commit()
 
             # ---------------------------------------------------------
-            # 5. Verify segments and finalize transcript
+            # 7. Finalize job
             # ---------------------------------------------------------
 
             with Session(engine) as session:
-
-                final_segments = session.exec(
-                    select(TranscriptSegment)
-                    .where(
-                        TranscriptSegment.job_id == job_id
-                    )
-                    .order_by(
-                        TranscriptSegment.segment_index
-                    )
-                ).all()
-
-                if not fallback_to_full_audio:
-
-                    unfinished = [
-                        segment.segment_index
-                        for segment in final_segments
-                        if segment.text is None
-                    ]
-
-                    if unfinished:
-                        raise RuntimeError(
-                            f"{len(unfinished)} ASR segments remain "
-                            f"unfinished; first indexes={unfinished[:10]}"
-                        )
 
                 job = session.get(Job, job_id)
 
                 if job is None:
                     raise RuntimeError(
-                        f"Job disappeared during ASR: {job_id}"
+                        f"Job disappeared: {job_id}"
                     )
 
-                if not fallback_to_full_audio:
-
-                    transcript_parts = [
-                        segment.text.strip()
-                        for segment in final_segments
-                        if segment.text and segment.text.strip()
-                    ]
-
-                    job.transcript = "\n".join(transcript_parts)
-
-                    languages = Counter(
-                        segment.language
-                        for segment in final_segments
-                        if segment.language
-                    )
-
-                    job.language = (
-                        languages.most_common(1)[0][0]
-                        if languages
-                        else None
-                    )
-
-                # For full-audio fallback, preserve the transcript
-                # and language already saved directly to Job.
-
-                job.status = JobStatus.PROCESSING
-                job.stage = JobStage.ALIGN
+                job.status = JobStatus.COMPLETED
+                job.stage = JobStage.COMPLETED
                 job.error = None
                 job.updated_at = utc_now()
 
                 session.add(job)
                 session.commit()
 
-            # ---------------------------------------------------------
-            # 6. Dispatch alignment
-            # ---------------------------------------------------------
-
-            align_task = publisher.send_task(
-                "process",
-                args=[{"job_id": str(job_id)}],
-                queue=ALIGN_QUEUE,
-            )
-
             logger.info(
-                "ASR completed job=%s; dispatched to queue=%s "
-                "task_id=%s elapsed=%.2fs",
+                "Alignment completed job=%s elapsed=%.2fs",
                 job_id,
-                ALIGN_QUEUE,
-                align_task.id,
                 time.perf_counter() - started,
             )
 
             return {
                 "job_id": str(job_id),
-                "status": "processing",
+                "status": "completed",
                 "stage": "align",
-                "segments": total_segments,
-                "fallback_to_full_audio": fallback_to_full_audio,
-                "next_queue": ALIGN_QUEUE,
-                "task_id": align_task.id,
             }
 
         except Exception as exc:
 
             logger.exception(
-                "ASR failed job=%s",
+                "Alignment failed job=%s",
                 job_id,
             )
-
-            # Save the latest error, but leave the job PROCESSING.
-            # The failed-task consumer marks it FAILED after retries
-            # have been exhausted.
 
             try:
                 with Session(engine) as session:
 
                     job = session.get(Job, job_id)
 
-                    if (
-                        job is not None
-                        and job.status != JobStatus.COMPLETED
-                    ):
+                    if job is not None:
                         job.status = JobStatus.PROCESSING
-                        job.stage = JobStage.ASR
+                        job.stage = JobStage.ALIGN
                         job.error = str(exc)[:4000]
                         job.updated_at = utc_now()
 
@@ -824,23 +806,19 @@ class ASRConsumer:
 
             except Exception:
                 logger.exception(
-                    "Could not persist ASR error for job=%s",
-                    job_id,
+                    "Could not persist alignment error"
                 )
 
             raise
 
         finally:
 
-            publisher.close()
-
             if temp_audio_path:
                 Path(temp_audio_path).unlink(missing_ok=True)
 
-                logger.info(
-                    "Cleaned up temporary audio job_id=%s",
-                    job_id,
-                )
+
+def enum_value(value):
+    return value.value if hasattr(value, "value") else str(value)
 
 
-app = ASRConsumer.bind()
+app = AlignmentConsumer.bind()
