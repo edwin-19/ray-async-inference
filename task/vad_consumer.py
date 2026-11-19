@@ -49,7 +49,7 @@ VAD_FAILED_QUEUE = os.getenv(
     "VAD_FAILED_QUEUE",
     "vad_failed_queue",
 )
-VAD_USE_GPU = os.getenv("VAD_USE_GPU", "false").lower() in ("1", "true", "yes", "on")
+VAD_USE_GPU = os.getenv("AUDIO_01_USE_GPU", "false").lower() in ("1", "true", "yes", "on")
 
 processor_config = TaskProcessorConfig(
     queue_name=VAD_QUEUE_NAME,
@@ -120,15 +120,15 @@ VAD_MODEL_PATH = Path(
 
 @serve.deployment(
     name="vad-consumer",
-    max_ongoing_requests=int(os.getenv("VAD_MAX_ONGOING_REQUESTS", "2")),
+    max_ongoing_requests=int(os.getenv("AUDIO_01_MAX_ONGOING_REQUESTS", "2")),
     ray_actor_options={
-        "num_cpus": float(os.getenv("VAD_NUM_CPUS", "2")),
+        "num_cpus": float(os.getenv("AUDIO_01_NUM_CPUS", "2")),
     },
     autoscaling_config=AutoscalingConfig(
-        min_replicas=int(os.getenv("VAD_MIN_REPLICAS", "1")),
-        max_replicas=int(os.getenv("VAD_MAX_REPLICAS", "2")),
+        min_replicas=int(os.getenv("AUDIO_01_MIN_REPLICAS", "1")),
+        max_replicas=int(os.getenv("AUDIO_01_MAX_REPLICAS", "2")),
         target_ongoing_requests=int(
-            os.getenv("VAD_TARGET_ONGOING_REQUESTS", "1")
+            os.getenv("AUDIO_01_TARGET_ONGOING_REQUESTS", "1")
         ),
     ),
 )

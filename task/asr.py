@@ -44,30 +44,30 @@ ASR_DEFAULT_LANGUAGE = (
     os.getenv("ASR_LANGUAGE", "").strip() or None
 )
 
-ASR_BATCH_SIZE = max(1, int(os.getenv("ASR_BATCH_SIZE", "8")))
+ASR_BATCH_SIZE = max(1, int(os.getenv("AUDIO_02_BATCH_SIZE", "8")))
 ASR_MAX_RETRIES = max(0, int(os.getenv("ASR_MAX_RETRIES", "3")))
 
 ASR_NUM_GPUS = float(
-    os.getenv("ASR_NUM_GPUS_PER_REPLICA", "1")
+    os.getenv("AUDIO_02_NUM_GPUS_PER_REPLICA", "1")
 )
 
 ASR_NUM_CPUS = int(
-    os.getenv("ASR_NUM_CPUS_PER_REPLICA", "2")
+    os.getenv("AUDIO_02_NUM_CPUS_PER_REPLICA", "2")
 )
 
 ASR_GPU_MEMORY_UTILIZATION = float(
-    os.getenv("ASR_GPU_MEMORY_UTILIZATION", "0.7")
+    os.getenv("AUDIO_02_GPU_MEMORY_UTILIZATION", "0.7")
 )
 
-ATTENTION_BACKEND = os.getenv("ATTENTION_BACKEND", "FLASHINFER")
+ATTENTION_BACKEND = os.getenv("AUDIO_02_ATTENTION_BACKEND", "FLASHINFER")
 SPECULATOR_MODEL = os.getenv("SPECULATOR_MODEL", "mattymchen/Qwen3-ASR-1.7B-speculator.dflash2")
 
 ASR_MAX_MODEL_LEN = int(
-    os.getenv("ASR_MAX_MODEL_LEN", "4096")
+    os.getenv("AUDIO_02_MAX_MODEL_LEN", "4096")
 )
 
 ASR_MAX_NEW_TOKENS = int(
-    os.getenv("ASR_MAX_NEW_TOKENS", "1028")
+    os.getenv("AUDIO_02_MAX_NEW_TOKENS", "1028")
 )
 
 
@@ -200,17 +200,15 @@ def enum_value(value):
 
 @serve.deployment(
     name="asr-consumer",
-    max_ongoing_requests=1,
+    max_ongoing_requests=int(os.getenv("AUDIO_02_TARGET_ONGOING_REQUESTS", "1")),
     ray_actor_options={
         "num_cpus": ASR_NUM_CPUS,
         "num_gpus": ASR_NUM_GPUS,
     },
     autoscaling_config=AutoscalingConfig(
-        min_replicas=int(os.getenv("ASR_MIN_REPLICAS", "1")),
-        max_replicas=int(os.getenv("ASR_MAX_REPLICAS", "1")),
-        target_ongoing_requests=int(
-            os.getenv("ASR_TARGET_ONGOING_REQUESTS", "1")
-        ),
+        min_replicas=int(os.getenv("AUDIO_02_MIN_REPLICAS", "1")),
+        max_replicas=int(os.getenv("AUDIO_02_MAX_REPLICAS", "1")),
+        target_ongoing_requests=int(os.getenv("AUDIO_02_TARGET_ONGOING_REQUESTS", "1")),
     ),
 )
 @task_consumer(task_processor_config=processor_config)

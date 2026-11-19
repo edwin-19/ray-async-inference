@@ -51,7 +51,7 @@ ALIGN_MODEL_NAME = os.getenv(
 
 ALIGN_BATCH_SIZE = max(
     1,
-    int(os.getenv("ALIGN_BATCH_SIZE", "4")),
+    int(os.getenv("AUDIO_03_BATCH_SIZE", "4")),
 )
 
 ALIGN_MAX_RETRIES = max(
@@ -65,11 +65,11 @@ ALIGN_DEVICE = os.getenv(
 ).lower()
 
 ALIGN_NUM_GPUS = float(
-    os.getenv("ALIGN_NUM_GPUS_PER_REPLICA", "1")
+    os.getenv("AUDIO_03_NUM_GPUS_PER_REPLICA", "1")
 )
 
 ALIGN_NUM_CPUS = int(
-    os.getenv("ALIGN_NUM_CPUS_PER_REPLICA", "2")
+    os.getenv("AUDIO_03_NUM_CPUS_PER_REPLICA", "2")
 )
 
 ALIGN_COMPILE = (
@@ -472,21 +472,21 @@ def item_field(
 
 @serve.deployment(
     name="align-consumer",
-    max_ongoing_requests=1,
+    max_ongoing_requests=int(os.getenv("AUDIO_03_TARGET_ONGOING_REQUESTS", "1")),
     ray_actor_options={
         "num_cpus": ALIGN_NUM_CPUS,
         "num_gpus": ALIGN_NUM_GPUS,
     },
     autoscaling_config=AutoscalingConfig(
         min_replicas=int(
-            os.getenv("ALIGN_MIN_REPLICAS", "1")
+            os.getenv("AUDIO_03_MIN_REPLICAS", "1")
         ),
         max_replicas=int(
-            os.getenv("ALIGN_MAX_REPLICAS", "1")
+            os.getenv("AUDIO_03_MAX_REPLICAS", "1")
         ),
         target_ongoing_requests=int(
             os.getenv(
-                "ALIGN_TARGET_ONGOING_REQUESTS",
+                "AUDIO_03_TARGET_ONGOING_REQUESTS",
                 "1",
             )
         ),

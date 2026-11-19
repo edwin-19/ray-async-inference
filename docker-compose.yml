@@ -77,27 +77,45 @@ services:
     networks:
       - inference
 
-  rabbitmq:
-    image: rabbitmq:4-management-alpine
-    container_name: rabbitmq
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:5672:5672"
-      - "127.0.0.1:15672:15672"
+  minio-init:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/speech-data
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-appuser}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
     networks:
       - inference
+    restart: "no"
+
+  # rabbitmq:
+  #   image: rabbitmq:4-management-alpine
+  #   container_name: rabbitmq
+  #   restart: unless-stopped
+  #   ports:
+  #     - "127.0.0.1:5672:5672"
+  #     - "127.0.0.1:15672:15672"
+  #   environment:
+  #     RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-appuser}
+  #     RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+  #   volumes:
+  #     - rabbitmq_data:/var/lib/rabbitmq
+  #     - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+  #   healthcheck:
+  #     test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+  #     interval: 15s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #   networks:
+  #     - inference
 
 volumes:
   redis_data:

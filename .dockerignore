@@ -1,0 +1,6 @@
+.git
+spare
+test
+rabbitmq.conf
+send_task.py
+server_config.yaml
