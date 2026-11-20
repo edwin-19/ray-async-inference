@@ -53,6 +53,15 @@ PY
 # Copy application.
 COPY . /app
 
+# RUN vllm download-kernels
+RUN python3 - <<'PY'
+from vllm.entrypoints.cli.download_kernels import _download_flashinfer_kernels
+
+_download_flashinfer_kernels(dry_run=False)
+PY
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Qwen/Qwen3-ASR-1.7B-hf')"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='mattymchen/Qwen3-ASR-1.7B-speculator.dflash2')"
+
 ENTRYPOINT []
 
 CMD ["serve", "run", "task.asr:app"]

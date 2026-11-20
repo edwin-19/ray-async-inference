@@ -4,3 +4,6 @@ test
 rabbitmq.conf
 send_task.py
 server_config.yaml
+build_dataset.py
+send_task.py
+batch_run.py

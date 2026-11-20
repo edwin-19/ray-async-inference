@@ -42,7 +42,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["1"]
+              device_ids: ["0"]
               capabilities: [gpu]
 
     env_file:
@@ -67,7 +67,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["2"]
+              device_ids: ["0"]
               capabilities: [gpu]
 
     env_file:
@@ -76,33 +76,27 @@ services:
     command: ["serve", "run", "task.align_consumer:app"]
 
   vad-failed-consumer:
-    # build:
-    #   context: ..
-    #   dockerfile: deploy/Dockerfile-asr
-    image: speech-asr:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile-failed
+    image: speech-vad-failed:latest
     container_name: vad-failed-consumer
     restart: unless-stopped
-
     network_mode: host
     working_dir: /app
-
     env_file:
       - ../.env
-
     command: ["serve", "run", "task.vad_failed_consumer:app"]
 
   asr-failed-consumer:
-    # build:
-    #   context: ..
-    #   dockerfile: deploy/Dockerfile-asr
-    image: speech-asr:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile-failed
+    image: speech-asr-failed:latest
     container_name: asr-failed-consumer
     restart: unless-stopped
-
     network_mode: host
     working_dir: /app
-
     env_file:
       - ../.env
-
     command: ["serve", "run", "task.asr_failed_consumer:app"]

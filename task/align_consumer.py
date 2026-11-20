@@ -1521,3 +1521,11 @@ class AlignConsumer:
 
 
 app = AlignConsumer.bind()
+# from ray import serve
+
+# serve.start(
+#     http_options={
+#         "host": "127.0.0.1",
+#         "port": 8002,
+#     }
+# )

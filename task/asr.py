@@ -310,11 +310,11 @@ class ASRConsumer:
             max_new_tokens=ASR_MAX_NEW_TOKENS,
             gpu_memory_utilization=ASR_GPU_MEMORY_UTILIZATION,
             max_num_seqs=ASR_BATCH_SIZE,
-            attention_backend=ATTENTION_BACKEND,
+            # attention_backend=ATTENTION_BACKEND,
             speculative_config = {
                 "method": "dflash",
                 "model": SPECULATOR_MODEL,
-                "attention_backend": ATTENTION_BACKEND,
+                # "attention_backend": ATTENTION_BACKEND,
                 "num_speculative_tokens": 7,
             }
         )

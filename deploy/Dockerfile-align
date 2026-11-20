@@ -29,4 +29,5 @@ RUN python3 -m pip install -r /app/requirements-align.txt
 
 COPY . /app
 
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Qwen/Qwen3-ForcedAligner-0.6B-hf')"
 CMD ["serve", "run", "task.align_consumer:app"]
